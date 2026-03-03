@@ -1,7 +1,7 @@
 import bpy
 import math
 
-from .create_materials import apply_textures, pack_textures
+from .create_materials import apply_textures, pack_textures, pack_wad2_textures
 
 
 def paint_vertex(obj):
@@ -51,6 +51,10 @@ def main(context, materials, wad, options):
         mesh.from_pydata(verts, [], faces)
         if options.one_material_per_object:
             pack_textures(context, [m], [obj], options, name)
+        elif getattr(options, 'wad2_pack_textures', False):
+            wad = getattr(options, 'wad', None)
+            if wad:
+                pack_wad2_textures(context, [m], [obj], options, wad, name)
         else:
             apply_textures(context, m, obj, materials, options, name)
         if options.flip_normals:
