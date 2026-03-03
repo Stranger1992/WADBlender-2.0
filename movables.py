@@ -3,7 +3,7 @@ import math
 import bpy
 
 from .objects import movables2discard
-from .create_materials import apply_textures, pack_textures, pack_wad2_textures
+from .create_materials import apply_textures, pack_textures
 from .animations import create_animations, save_animations_data
 
 def paint_vertex(mesh):
@@ -47,8 +47,7 @@ def main(context, materials, wad, options):
         col_movables.children.link(collection)
 
         meshes = []
-        meshes2 = []
-        model_meshes = []  # WAD2: keep model mesh data for pack_wad2_textures
+        meshes2 = []        
         for j, m in enumerate(movable.meshes):
             verts = [[v / options.scale for v in e] for e in m.vertices]
             faces = [e.face for e in m.polygons]
@@ -98,10 +97,7 @@ def main(context, materials, wad, options):
             # mesh_obj.data.use_auto_smooth removed in Blender 5.0+
 
             if not options.one_material_per_object:
-                if getattr(options, 'wad2_pack_textures', False):
-                    model_meshes.append(m)  # collect for pack_wad2_textures
-                else:
-                    apply_textures(context, m, mesh_obj, materials, options)
+                apply_textures(context, m, mesh_obj, materials, options)
                 if options.flip_normals:
                     mesh_data.flip_normals()
             else:
@@ -114,11 +110,7 @@ def main(context, materials, wad, options):
             for obj in meshes:
                 if options.flip_normals:
                     obj.data.flip_normals()
-        elif getattr(options, 'wad2_pack_textures', False) and model_meshes:
-            wad = getattr(options, 'wad', None)
-            if wad:
-                pack_wad2_textures(context, model_meshes, meshes, options, wad, name)
-
+            
         movable_objects[name] = meshes
         animations[name] = movable.animations
 

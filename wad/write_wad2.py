@@ -1,30 +1,18 @@
 """
-WAD2 Writer — exports Blender scene data to WAD2 format.
-
-Binary format matches Tomb Editor's Wad2Writer.cs / Wad2Loader.cs exactly:
-  - ChunkWriter framing: magic, chunk IDs as LEB128-length-prefixed strings,
-    chunk sizes as LEB128, nested children terminated by zero-length ID.
-  - Textures stored as raw BGRA byte arrays.
-  - Polygons written as W2Tr2/W2Uq2 with ParentArea, per-vertex UVs in
-    pixel coordinates, LEB128-encoded BlendMode, and boolean DoubleSided.
-
-Reference chunk IDs from Wad2Chunks.cs.
+WAD2 File Format Writer
+Implements chunk-based binary writing with LEB128 encoding
+Compatible with Tomb Editor's WAD2 format
 """
 
 import struct
 import io
 import math
-from typing import List, Dict, Tuple, Optional, BinaryIO
+from typing import BinaryIO, List, Tuple, Optional, Dict, Any
+from . import wad2_chunks
 
 
-# ---------------------------------------------------------------------------
-# LEB128 helpers
-# ---------------------------------------------------------------------------
-
-def write_leb128_unsigned(f: BinaryIO, value: int):
-    """Write an unsigned LEB128 integer."""
-    if value < 0:
-        raise ValueError(f"Cannot write negative value {value} as unsigned LEB128")
+def write_leb128_uint(f: BinaryIO, value: int):
+    """Write LEB128 variable-length unsigned integer"""
     while True:
         byte = value & 0x7F
         value >>= 7
@@ -35,13 +23,13 @@ def write_leb128_unsigned(f: BinaryIO, value: int):
             break
 
 
-def write_leb128_signed(f: BinaryIO, value: int):
-    """Write a signed LEB128 integer (matches C# LEB128.Write(long))."""
+def write_leb128_int(f: BinaryIO, value: int):
+    """Write LEB128 variable-length signed integer"""
     more = True
     while more:
         byte = value & 0x7F
         value >>= 7
-        # Sign bit of byte is second high order bit (0x40)
+        # Sign bit of byte is second high bit (0x40)
         if (value == 0 and (byte & 0x40) == 0) or (value == -1 and (byte & 0x40) != 0):
             more = False
         else:
@@ -50,722 +38,680 @@ def write_leb128_signed(f: BinaryIO, value: int):
 
 
 def write_string(f: BinaryIO, s: str):
-    """Write a UTF-8 length-prefixed string (LEB128 length)."""
-    encoded = s.encode('utf-8')
-    write_leb128_unsigned(f, len(encoded))
-    f.write(encoded)
+    """Write length-prefixed string"""
+    data = s.encode('utf-8')
+    write_leb128_uint(f, len(data))
+    f.write(data)
 
 
-def write_string_utf8(f: BinaryIO, s: str):
-    """Write a UTF-8 string with int32 length prefix.
-
-    Matches C# ``BinaryWriterFast.WriteStringUTF8`` which uses a 4-byte
-    little-endian length prefix, NOT LEB128.
-    """
-    encoded = s.encode('utf-8')
-    f.write(struct.pack('<i', len(encoded)))
-    f.write(encoded)
+def write_vector3(f: BinaryIO, vec: Tuple[float, float, float]):
+    """Write 3 floats as a vector (little-endian)"""
+    f.write(struct.pack('<fff', vec[0], vec[1], vec[2]))
 
 
-def write_vector2(f: BinaryIO, x: float, y: float):
-    f.write(struct.pack('<ff', x, y))
+def write_vector2(f: BinaryIO, vec: Tuple[float, float]):
+    """Write 2 floats as a vector (little-endian)"""
+    f.write(struct.pack('<ff', vec[0], vec[1]))
 
 
-def write_vector3(f: BinaryIO, x: float, y: float, z: float):
-    f.write(struct.pack('<fff', x, y, z))
+def write_vector4(f: BinaryIO, vec: Tuple[float, float, float, float]):
+    """Write 4 floats as a vector (little-endian)"""
+    f.write(struct.pack('<ffff', vec[0], vec[1], vec[2], vec[3]))
 
 
-def write_vector4(f: BinaryIO, x: float, y: float, z: float, w: float):
-    f.write(struct.pack('<ffff', x, y, z, w))
+def write_bool(f: BinaryIO, value: bool):
+    """Write boolean value"""
+    f.write(struct.pack('?', value))
 
 
-def write_bool(f: BinaryIO, val: bool):
-    f.write(struct.pack('?', val))
+def write_float(f: BinaryIO, value: float):
+    """Write single float (little-endian)"""
+    f.write(struct.pack('<f', value))
 
 
-def write_float(f: BinaryIO, val: float):
-    f.write(struct.pack('<f', val))
+def write_chunk_id(f: BinaryIO, chunk_id: bytes):
+    """Write chunk identifier (length-prefixed bytes)"""
+    write_leb128_uint(f, len(chunk_id))
+    f.write(chunk_id)
 
-
-# ---------------------------------------------------------------------------
-# Chunk writer (mirrors C# ChunkWriter)
-# ---------------------------------------------------------------------------
 
 class ChunkWriter:
-    """
-    Writes WAD2 chunks.  Each chunk is:
-      - Chunk ID: LEB128 string length + UTF-8 bytes
-      - Chunk size: LEB128 uint (size of the body that follows)
-      - Chunk body: raw bytes
-    A parent chunk's body contains child chunks terminated by a zero-length
-    chunk ID (a single 0x00 byte).
-    """
+    """Writes chunks to WAD2 file"""
 
     def __init__(self, stream: BinaryIO):
         self.stream = stream
+        self.chunk_stack = []  # Stack of (chunk_id, buffer)
 
-    # -- low-level helpers --------------------------------------------------
+    def write_chunk_start(self, chunk_id: bytes):
+        """Start writing a new chunk"""
+        buffer = io.BytesIO()
+        self.chunk_stack.append((chunk_id, buffer))
 
-    def _write_chunk_id(self, chunk_id: str):
-        """Write a chunk ID as a length-prefixed UTF-8 string."""
-        encoded = chunk_id.encode('utf-8')
-        write_leb128_unsigned(self.stream, len(encoded))
-        self.stream.write(encoded)
+    def write_chunk_end(self):
+        """Finish writing current chunk and write to parent/stream"""
+        if not self.chunk_stack:
+            return
 
-    def _write_chunk_end(self):
-        """Write the terminator for a children-bearing chunk (zero-length ID)."""
-        write_leb128_unsigned(self.stream, 0)
+        chunk_id, buffer = self.chunk_stack.pop()
+        data = buffer.getvalue()
 
-    # -- public API ---------------------------------------------------------
+        # Get target stream (parent buffer or main stream)
+        if self.chunk_stack:
+            target = self.chunk_stack[-1][1]
+        else:
+            target = self.stream
 
-    def write_chunk_with_children(self, chunk_id: str, write_fn):
-        """Write a chunk that contains child chunks.
+        # Write chunk: ID + size + data
+        write_chunk_id(target, chunk_id)
+        write_leb128_uint(target, len(data))
+        target.write(data)
 
-        *write_fn* is called to write the children; afterwards a terminator
-        is emitted.  The whole thing is buffered so the chunk size can be
-        back-patched.
-        """
-        # Buffer the body so we know its size before writing
-        body_buf = io.BytesIO()
-        saved = self.stream
-        self.stream = body_buf
-        write_fn()
-        self._write_chunk_end()
-        self.stream = saved
+    def get_current_buffer(self) -> BinaryIO:
+        """Get the current writing buffer"""
+        if self.chunk_stack:
+            return self.chunk_stack[-1][1]
+        return self.stream
 
-        body = body_buf.getvalue()
-        self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(body))
-        self.stream.write(body)
+    def write_chunk_string(self, chunk_id: bytes, s: str):
+        """Write a simple string chunk"""
+        self.write_chunk_start(chunk_id)
+        buf = self.get_current_buffer()
+        data = s.encode('utf-8')
+        buf.write(data)
+        self.write_chunk_end()
 
-    def write_chunk_raw(self, chunk_id: str, data: bytes):
-        """Write a chunk whose body is a raw byte blob."""
-        self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
-        self.stream.write(data)
+    def write_chunk_uint(self, chunk_id: bytes, value: int):
+        """Write a simple uint chunk"""
+        self.write_chunk_start(chunk_id)
+        write_leb128_uint(self.get_current_buffer(), value)
+        self.write_chunk_end()
 
-    def write_chunk_int(self, chunk_id: str, value: int):
-        """Write a chunk containing a single LEB128 signed int."""
-        buf = io.BytesIO()
-        write_leb128_signed(buf, value)
-        self.write_chunk_raw(chunk_id, buf.getvalue())
+    def write_chunk_int(self, chunk_id: bytes, value: int):
+        """Write a simple int chunk"""
+        self.write_chunk_start(chunk_id)
+        write_leb128_int(self.get_current_buffer(), value)
+        self.write_chunk_end()
 
-    def write_chunk_float(self, chunk_id: str, value: float):
-        buf = struct.pack('<f', value)
-        self.write_chunk_raw(chunk_id, buf)
+    def write_chunk_float(self, chunk_id: bytes, value: float):
+        """Write a simple float chunk"""
+        self.write_chunk_start(chunk_id)
+        write_float(self.get_current_buffer(), value)
+        self.write_chunk_end()
 
-    def write_chunk_bool(self, chunk_id: str, value: bool):
-        self.write_chunk_raw(chunk_id, struct.pack('?', value))
-
-    def write_chunk_string(self, chunk_id: str, s: str):
-        buf = io.BytesIO()
-        write_string(buf, s)
-        self.write_chunk_raw(chunk_id, buf.getvalue())
-
-    def write_chunk_vector3(self, chunk_id: str, v):
-        """v is (x, y, z) or any 3-element iterable."""
-        buf = struct.pack('<fff', v[0], v[1], v[2])
-        self.write_chunk_raw(chunk_id, buf)
-
-    def write_chunk_vector2(self, chunk_id: str, v):
-        buf = struct.pack('<ff', v[0], v[1])
-        self.write_chunk_raw(chunk_id, buf)
-
-    def write_chunk_vector4(self, chunk_id: str, v):
-        buf = struct.pack('<ffff', v[0], v[1], v[2], v[3])
-        self.write_chunk_raw(chunk_id, buf)
-
-    def write_chunk_bytes(self, chunk_id: str, data: bytes):
-        """Write a chunk whose body is a raw byte array (e.g. texture data)."""
-        self.write_chunk_raw(chunk_id, data)
+    def write_chunk_vector3(self, chunk_id: bytes, vec: Tuple[float, float, float]):
+        """Write a simple vector3 chunk"""
+        self.write_chunk_start(chunk_id)
+        write_vector3(self.get_current_buffer(), vec)
+        self.write_chunk_end()
 
 
-# ---------------------------------------------------------------------------
-# Chunk IDs — must match Wad2Chunks.cs exactly
-# ---------------------------------------------------------------------------
-
-class W2:
-    """WAD2 chunk ID strings matching Wad2Chunks.cs."""
-    GameVersion = "W2SuggestedGameVersion"
-    SoundSystem = "W2SoundSystem"
-    Metadata = "W2Metadata"
-    Timestamp = "W2Timestamp"
-    UserNotes = "W2UserNotes"
-
-    # Textures
-    Textures = "W2Textures"
-    Texture = "W2Txt"
-    TextureIndex = "W2Index"
-    TextureData = "W2TxtData"
-    TextureName = "W2TxtName"
-    TextureRelativePath = "W2TxtRelPath"
-
-    # Meshes
-    Meshes = "W2Meshes"
-    Mesh = "W2Mesh"
-    MeshIndex = "W2Index"
-    MeshName = "W2MeshName"
-    MeshSphere = "W2MeshSphere"
-    MeshSphereCenter = "W2SphC"
-    MeshSphereRadius = "W2SphR"
-    MeshBoundingBox = "W2BBox"
-    MeshBoundingBoxMin = "W2BBMin"
-    MeshBoundingBoxMax = "W2BBMax"
-    MeshVertexPositions = "W2VrtPos"
-    MeshVertexPosition = "W2Pos"
-    MeshVertexNormals = "W2VrtNorm"
-    MeshVertexNormal = "W2N"
-    MeshVertexShades = "W2VrtShd"
-    MeshVertexColor = "W2VxCol"
-    MeshVertexAttributes = "W2VrtAttr"
-    MeshVertexAttribute = "W2VxAttr"
-    MeshVertexWeights = "W2VrtWghts"
-    MeshVertexWeight = "W2VrtWght"
-    MeshLightingType = "W2MeshLightType"
-    MeshVisibility = "W2MeshVisible"
-    MeshPolygons = "W2Polys"
-    MeshTriangle2 = "W2Tr2"
-    MeshQuad2 = "W2Uq2"
-
-    # Moveables
-    Moveables = "W2Moveables"
-    Moveable = "W2Moveable"
-    MoveableSkin = "W2MovSkin"
-    MoveableBone = "W2Bone2"
-    MoveableBoneName = "W2BoneName"
-    MoveableBoneTranslation = "W2BoneTrans"
-    MoveableBoneMeshPointer = "W2BoneMesh"
-
-    # Animations
-    Animation = "W2Ani3"
-    AnimationName = "W2AnmName"
-    AnimationVelocities = "W2AniV"
-    KeyFrames = "W2Kfs"
-    KeyFrame = "W2Kf"
-    KeyFrameOffset = "W2KfOffs"
-    KeyFrameBoundingBox = "W2KfBB"
-    KeyFrameAngle = "W2KfA"
-    StateChange = "W2StCh"
-    Dispatch = "W2Disp2"
-    AnimCommand = "W2Cmd2"
-    AnimCommandSoundInfo = "W2CmdSnd"
-    CurveStart = "W2CurveStart"
-    CurveEnd = "W2CurveEnd"
-    CurveStartHandle = "W2CurveHStart"
-    CurveEndHandle = "W2CurveHEnd"
-
-    # Statics
-    Statics = "W2Statics"
-    Static = "W2Static2"
-    StaticVisibilityBox = "W2StaticVB"
-    StaticCollisionBox = "W2StaticCB"
-    StaticAmbientLight = "W2StaticAmbientLight"
-    StaticShatter = "W2StaticShatter"
-    StaticShatterSound = "W2StaticShatterSound"
-    StaticLight = "W2StaticLight"
-    StaticLightPosition = "W2StaticLightPos"
-    StaticLightRadius = "W2StaticLightR"
-    StaticLightIntensity = "W2StaticLightI"
-
-    # Sprites (stubs)
-    Sprites = "W2Sprites"
-    SpriteSequences = "W2SpriteSequences"
-
-    # Animated texture sets (stubs)
-    AnimatedTextureSets = "W2AnimatedTextureSets"
+def _fix_axis_to_wad2(vec: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """Convert Blender axes (Z-up, -Y forward) to WAD2 (Y-up)"""
+    # Blender: X right, Y back, Z up
+    # WAD2: X right, Y up, Z back
+    # So: wad2.x = -blender.x, wad2.y = blender.z, wad2.z = -blender.y
+    return (-vec[0], vec[2], -vec[1])
 
 
-# ---------------------------------------------------------------------------
-# Game version enum (matches C# TRVersion.Game)
-# ---------------------------------------------------------------------------
+def _quat_to_euler_ypr(quat: Tuple[float, float, float, float]) -> Tuple[float, float, float]:
+    """Convert quaternion to yaw-pitch-roll euler angles (in degrees)"""
+    w, x, y, z = quat
 
-GAME_VERSIONS = {
-    'TR1': 0, 'TR2': 1, 'TR3': 2, 'TR4': 3, 'TR5': 4,
-    'TRNG': 5, 'TombEngine': 6,
-    'TR1X': 7, 'TR2X': 8,
-}
+    # Yaw (Y axis rotation)
+    siny_cosp = 2.0 * (w * y + z * x)
+    cosy_cosp = 1.0 - 2.0 * (x * x + y * y)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
 
+    # Pitch (X axis rotation)
+    sinp = 2.0 * (w * x - y * z)
+    if abs(sinp) >= 1:
+        pitch = math.copysign(math.pi / 2, sinp)
+    else:
+        pitch = math.asin(sinp)
 
-# ---------------------------------------------------------------------------
-# Write functions (match C# Wad2Writer exactly)
-# ---------------------------------------------------------------------------
+    # Roll (Z axis rotation)
+    sinr_cosp = 2.0 * (w * z + x * y)
+    cosr_cosp = 1.0 - 2.0 * (z * z + x * x)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
 
-def _write_texture(cw: ChunkWriter, texture: dict, index: int):
-    """Write a single texture chunk.
-
-    C# layout:
-        LEB128 width, LEB128 height,
-        W2TxtName string, W2TxtRelPath string, W2TxtData byte[]
-    """
-    def _inner():
-        write_leb128_unsigned(cw.stream, texture['width'])
-        write_leb128_unsigned(cw.stream, texture['height'])
-        cw.write_chunk_string(W2.TextureName, texture.get('name', ''))
-        cw.write_chunk_string(W2.TextureRelativePath, texture.get('rel_path', ''))
-        cw.write_chunk_bytes(W2.TextureData, texture['data'])
-
-    cw.write_chunk_with_children(W2.Texture, _inner)
+    return (math.degrees(yaw), math.degrees(pitch), math.degrees(roll))
 
 
-def _write_textures(cw: ChunkWriter, textures: List[dict]):
-    def _inner():
-        for i, tex in enumerate(textures):
-            _write_texture(cw, tex, i)
-    cw.write_chunk_with_children(W2.Textures, _inner)
+class Wad2Writer:
+    """Writes WAD2 files"""
 
+    def __init__(self):
+        self.version = 150  # TEN version
+        self.sound_system = 0
 
-def _write_mesh(cw: ChunkWriter, mesh: dict, texture_map: Dict[int, int]):
-    """Write a single mesh chunk.
+    def write(self, filepath: str, wad_data: dict, options):
+        """Write WAD2 file"""
+        with open(filepath, 'wb') as f:
+            self.write_to_stream(f, wad_data, options)
 
-    mesh dict keys:
-        name, positions [(x,y,z)...], normals [(x,y,z)...],
-        shades [float...] (vertex colours as 0-1 greyscale or (r,g,b)),
-        triangles [poly_dict...], quads [poly_dict...],
-        sphere {center, radius}, bbox {min, max}
-    """
-    def _inner():
-        cw.write_chunk_int(W2.MeshIndex, 0)
-        cw.write_chunk_string(W2.MeshName, mesh.get('name', ''))
+    def write_to_stream(self, stream: BinaryIO, wad_data: dict, options):
+        """Write WAD2 to stream (matching Wad2Writer.cs structure)"""
+        # Write magic number
+        stream.write(b'WAD2')
 
-        # Bounding sphere
-        sphere = mesh.get('sphere', {})
-        center = sphere.get('center', (0, 0, 0))
-        radius = sphere.get('radius', 0)
-        def _sphere():
-            cw.write_chunk_vector3(W2.MeshSphereCenter, center)
-            cw.write_chunk_float(W2.MeshSphereRadius, float(radius))
-        cw.write_chunk_with_children(W2.MeshSphere, _sphere)
+        # Write version/flags (4 bytes)
+        stream.write(struct.pack('<I', 0))
 
-        # Bounding box
-        bbox = mesh.get('bbox', {})
-        def _bbox():
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMin, bbox.get('min', (0, 0, 0)))
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMax, bbox.get('max', (0, 0, 0)))
-        cw.write_chunk_with_children(W2.MeshBoundingBox, _bbox)
+        # Create chunk writer
+        writer = ChunkWriter(stream)
 
-        # Vertex positions
-        def _positions():
-            for pos in mesh.get('positions', []):
-                cw.write_chunk_vector3(W2.MeshVertexPosition, pos)
-        cw.write_chunk_with_children(W2.MeshVertexPositions, _positions)
+        # Write suggested game version
+        writer.write_chunk_uint(wad2_chunks.ChunkId.SuggestedGameVersion, self.version)
 
-        # Vertex normals
-        def _normals():
-            for n in mesh.get('normals', []):
-                cw.write_chunk_vector3(W2.MeshVertexNormal, n)
-        cw.write_chunk_with_children(W2.MeshVertexNormals, _normals)
+        # Write sound system (1 = XML-based sound system)
+        writer.write_chunk_uint(wad2_chunks.ChunkId.SoundSystem, 1)
 
-        # Vertex colours / shades
+        # Write textures
+        textures = wad_data.get('textures', [])
+        self.write_textures(writer, textures)
+
+        # Write sprites (empty container)
+        writer.write_chunk_start(wad2_chunks.ChunkId.Sprites)
+        writer.write_chunk_end()
+
+        # Write sprite sequences (empty container)
+        writer.write_chunk_start(wad2_chunks.ChunkId.SpriteSequences)
+        writer.write_chunk_end()
+
+        # Write moveables
+        moveables = wad_data.get('moveables', [])
+        self.write_moveables(writer, moveables, options)
+
+        # Write statics
+        statics = wad_data.get('statics', [])
+        self.write_statics(writer, statics, options)
+
+        # Write metadata
+        self.write_metadata(writer)
+
+    def write_metadata(self, writer: ChunkWriter):
+        """Write WAD2 metadata chunk"""
+        import datetime
+
+        writer.write_chunk_start(wad2_chunks.ChunkId.Metadata)
+
+        # Write timestamp
+        now = datetime.datetime.now()
+        writer.write_chunk_start(b'W2Timestamp')
+        buf = writer.get_current_buffer()
+        write_leb128_uint(buf, now.year)
+        write_leb128_uint(buf, now.month)
+        write_leb128_uint(buf, now.day)
+        write_leb128_uint(buf, now.hour)
+        write_leb128_uint(buf, now.minute)
+        write_leb128_uint(buf, now.second)
+        writer.write_chunk_end()
+
+        # Write user notes (empty)
+        writer.write_chunk_string(b'W2UserNotes', '')
+
+        writer.write_chunk_end()
+
+    def write_textures(self, writer: ChunkWriter, textures: List[dict]):
+        """Write texture data as raw RGBA bytes (width * height * 4)."""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Textures)
+
+        for i, texture in enumerate(textures):
+            writer.write_chunk_start(wad2_chunks.ChunkId.Txt)
+            buf = writer.get_current_buffer()
+
+            width = texture.get('width', 256)
+            height = texture.get('height', 256)
+
+            # Write dimensions first (before sub-chunks) - required by WAD2 format
+            write_leb128_uint(buf, width)
+            write_leb128_uint(buf, height)
+
+            # Write index sub-chunk
+            writer.write_chunk_uint(wad2_chunks.ChunkId.TxtIndex, texture.get('index', i))
+
+            # Write name sub-chunk if present
+            if texture.get('name'):
+                writer.write_chunk_string(wad2_chunks.ChunkId.TxtName, texture['name'])
+
+            # Write texture data as raw bytes
+            if texture.get('data'):
+                raw_data = texture['data']
+                expected = width * height * 4
+                if len(raw_data) != expected:
+                    if len(raw_data) > expected:
+                        raw_data = raw_data[:expected]
+                    else:
+                        raw_data = raw_data + bytes(expected - len(raw_data))
+                writer.write_chunk_start(wad2_chunks.ChunkId.TxtData)
+                writer.get_current_buffer().write(raw_data)
+                writer.write_chunk_end()
+
+            writer.write_chunk_end()
+
+        writer.write_chunk_end()
+
+    def _create_png(self, bgra_data: bytes, width: int, height: int) -> Optional[bytes]:
+        """Deprecated: WAD2 expects raw bytes, not PNG."""
+        return None
+
+    def write_meshes(self, writer: ChunkWriter, meshes: List[dict], options):
+        """Write root-level mesh data"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Meshes)
+
+        for mesh in meshes:
+            self.write_single_mesh(writer, mesh, options)
+
+        writer.write_chunk_end()
+
+    def write_single_mesh(self, writer: ChunkWriter, mesh: dict, options):
+        """Write a single mesh matching Wad2Writer.cs format"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Mesh)
+
+        scale = options.get('scale', 512.0)
+
+        # Write mesh index (always 0 for embedded meshes)
+        writer.write_chunk_uint(wad2_chunks.ChunkId.MeshIndex, 0)
+
+        # Write mesh name if present
+        if mesh.get('name'):
+            writer.write_chunk_string(wad2_chunks.ChunkId.MeshName, mesh['name'])
+
+        # Write bounding sphere as container chunk
+        sphere = mesh.get('sphere')
+        if sphere:
+            center = sphere.get('center', (0, 0, 0))
+            radius = sphere.get('radius', 0)
+            wad_center = _fix_axis_to_wad2((center[0] * scale, center[1] * scale, center[2] * scale))
+
+            writer.write_chunk_start(wad2_chunks.ChunkId.MeshSphere)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshSphC, wad_center)
+            writer.write_chunk_float(wad2_chunks.ChunkId.MeshSphR, radius * scale)
+            writer.write_chunk_end()
+
+        # Write bounding box as container chunk
+        bbox = mesh.get('bbox')
+        if bbox:
+            bbox_min = bbox.get('min', (0, 0, 0))
+            bbox_max = bbox.get('max', (0, 0, 0))
+            wad_min = _fix_axis_to_wad2((bbox_min[0] * scale, bbox_min[1] * scale, bbox_min[2] * scale))
+            wad_max = _fix_axis_to_wad2((bbox_max[0] * scale, bbox_max[1] * scale, bbox_max[2] * scale))
+
+            writer.write_chunk_start(wad2_chunks.ChunkId.MeshBoundingBox)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMin, wad_min)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMax, wad_max)
+            writer.write_chunk_end()
+
+        # Write positions as container with individual position sub-chunks
+        positions = mesh.get('positions', [])
+        if positions:
+            writer.write_chunk_start(wad2_chunks.ChunkId.MeshVertexPositions)
+            for pos in positions:
+                wad_pos = _fix_axis_to_wad2((pos[0] * scale, pos[1] * scale, pos[2] * scale))
+                writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshVertexPosition, wad_pos)
+            writer.write_chunk_end()
+
+        # Write normals as container with individual normal sub-chunks
+        normals = mesh.get('normals', [])
+        if normals:
+            writer.write_chunk_start(wad2_chunks.ChunkId.MeshVertexNormals)
+            for normal in normals:
+                wad_norm = _fix_axis_to_wad2(normal)
+                writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshVertexNormal, wad_norm)
+            writer.write_chunk_end()
+
+        # Write vertex colors/shades as container with individual color sub-chunks
         shades = mesh.get('shades', [])
         if shades:
-            def _shades():
-                for shade in shades:
-                    if isinstance(shade, (int, float)):
-                        v = float(shade)
-                        cw.write_chunk_vector3(W2.MeshVertexColor, (v, v, v))
-                    else:
-                        cw.write_chunk_vector3(W2.MeshVertexColor, shade)
-            cw.write_chunk_with_children(W2.MeshVertexShades, _shades)
+            writer.write_chunk_start(wad2_chunks.ChunkId.MeshVertexShades)
+            for shade in shades:
+                # Convert byte shade to float color (grayscale)
+                val = shade / 255.0 if isinstance(shade, int) else 0.5
+                writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshVertexColor, (val, val, val))
+            writer.write_chunk_end()
 
-        # Vertex attributes (stub — write empty container)
-        cw.write_chunk_with_children(W2.MeshVertexAttributes, lambda: None)
+        # Write lighting type (default to 0 = Normals)
+        writer.write_chunk_uint(wad2_chunks.ChunkId.MeshLightingType, 0)
 
-        # Vertex weights (stub)
-        cw.write_chunk_with_children(W2.MeshVertexWeights, lambda: None)
+        # Write polygons as container with individual polygon sub-chunks
+        triangles = mesh.get('triangles', [])
+        quads = mesh.get('quads', [])
+        if triangles or quads:
+            writer.write_chunk_start(wad2_chunks.ChunkId.MeshPolys)
 
-        # Lighting type: 0 = default
-        cw.write_chunk_int(W2.MeshLightingType, 0)
-        # Visibility: False = visible
-        cw.write_chunk_bool(W2.MeshVisibility, False)
+            for tri in triangles:
+                self.write_polygon(writer, tri, 3, options)
 
-        # Polygons
-        def _polys():
-            for poly in mesh.get('triangles', []):
-                _write_polygon(cw, poly, is_quad=False, texture_map=texture_map)
-            for poly in mesh.get('quads', []):
-                _write_polygon(cw, poly, is_quad=True, texture_map=texture_map)
-        cw.write_chunk_with_children(W2.MeshPolygons, _polys)
+            for quad in quads:
+                self.write_polygon(writer, quad, 4, options)
 
-    cw.write_chunk_with_children(W2.Mesh, _inner)
+            writer.write_chunk_end()
 
+        writer.write_chunk_end()
 
-def _write_polygon(cw: ChunkWriter, poly: dict, is_quad: bool, texture_map: Dict[int, int]):
-    """Write a single polygon chunk (W2Tr2 or W2Uq2).
+    def write_polygon(self, writer: ChunkWriter, poly: dict, vertex_count: int, options):
+        """Write a single polygon (triangle or quad)
 
-    C# binary layout inside the chunk body:
-        LEB128 Index0, Index1, Index2, [Index3 if quad]
-        LEB128 ShineStrength
-        LEB128 TextureIndex
-        Vector2 ParentArea.Start  (always written for W2Tr2/W2Uq2)
-        Vector2 ParentArea.End
-        Vector2 TexCoord0, TexCoord1, TexCoord2, [TexCoord3 if quad]
-        LEB128 signed BlendMode
-        bool DoubleSided
-    """
-    chunk_id = W2.MeshQuad2 if is_quad else W2.MeshTriangle2
-    indices = poly.get('indices', [])
-    vertex_count = 4 if is_quad else 3
+        Format (W2Tr2/W2Uq2) based on Wad2Writer.cs:
+        - vertex_count LEB128 indices
+        - LEB128 shine_strength
+        - LEB128 texture_index
+        - vector2 ParentArea.Start (8 bytes)
+        - vector2 ParentArea.End (8 bytes)
+        - vertex_count * vector2 UVs (8 bytes each)
+        - LEB128 blend_mode
+        - bool double_sided (1 byte)
+        """
+        chunk_id = wad2_chunks.ChunkId.MeshTri2 if vertex_count == 3 else wad2_chunks.ChunkId.MeshQuad2
 
-    def _inner():
-        # Vertex indices
-        for i in range(vertex_count):
-            idx = indices[i] if i < len(indices) else 0
-            write_leb128_unsigned(cw.stream, idx)
+        writer.write_chunk_start(chunk_id)
+        buf = writer.get_current_buffer()
 
-        # Shine strength
-        write_leb128_unsigned(cw.stream, poly.get('shine', 0))
+        # Write vertex indices as LEB128
+        indices = poly.get('indices', [0] * vertex_count)
+        for idx in indices[:vertex_count]:
+            write_leb128_uint(buf, idx)
 
-        # Texture index — map material index to WAD2 texture table index
-        mat_idx = poly.get('texture', 0)
-        tex_idx = texture_map.get(mat_idx, 0)
-        write_leb128_unsigned(cw.stream, tex_idx)
+        # Write shine strength as LEB128
+        write_leb128_uint(buf, poly.get('shine', 0))
 
-        # ParentArea (Start + End) — write zeros (no parent atlas)
-        write_vector2(cw.stream, 0.0, 0.0)
-        write_vector2(cw.stream, 0.0, 0.0)
+        # Write texture index as LEB128
+        write_leb128_uint(buf, poly.get('texture', 0))
 
-        # UV coordinates in pixel space
-        uvs = poly.get('uvs', [])
+        # Write ParentArea (two vector2s = 16 bytes)
+        # ParentArea.Start and ParentArea.End - default to 0,0 to full texture
+        parent_start = poly.get('parent_area_start', (0.0, 0.0))
+        parent_end = poly.get('parent_area_end', (1.0, 1.0))
+        write_vector2(buf, parent_start)
+        write_vector2(buf, parent_end)
+
+        # Write UVs (vertex_count * 8 bytes)
+        uvs = poly.get('uvs', [(0.0, 0.0)] * vertex_count)
+        tex_width = options.get('tex_width', 256)
+        tex_height = options.get('tex_height', 256)
+
         for i in range(vertex_count):
             if i < len(uvs):
                 u, v = uvs[i]
+                # Convert from normalized [0,1] to pixel coordinates
+                u_px = u * tex_width
+                v_px = (1.0 - v) * tex_height  # Flip V
             else:
-                u, v = 0.0, 0.0
-            write_vector2(cw.stream, u, v)
+                u_px, v_px = 0.0, 0.0
+            write_vector2(buf, (u_px, v_px))
 
-        # BlendMode as LEB128 signed long
-        write_leb128_signed(cw.stream, poly.get('blend_mode', 0))
+        # Write blend mode as LEB128 (not int16!)
+        write_leb128_uint(buf, poly.get('blend_mode', 0))
 
-        # DoubleSided as boolean byte
-        write_bool(cw.stream, poly.get('double_sided', False))
+        # Write double-sided flag (1 byte bool)
+        write_bool(buf, poly.get('double_sided', False))
 
-    cw.write_chunk_with_children(chunk_id, _inner)
+        writer.write_chunk_end()
 
+    def write_moveables(self, writer: ChunkWriter, moveables: List[dict], options):
+        """Write moveable objects"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Moveables)
 
-def _write_bone(cw: ChunkWriter, bone: dict, index: int):
-    """Write a single bone chunk (W2Bone2).
-
-    C# layout:
-        LEB128 OpCode
-        string Name (raw UTF-8, not chunk)
-        W2BoneTrans Vector3
-        W2BoneMesh int
-    """
-    def _inner():
-        write_leb128_unsigned(cw.stream, bone.get('op', 0))
-        write_string_utf8(cw.stream, bone.get('name', f'bone_{index}'))
-        cw.write_chunk_vector3(W2.MoveableBoneTranslation, bone.get('translation', (0, 0, 0)))
-        cw.write_chunk_int(W2.MoveableBoneMeshPointer, bone.get('mesh', index))
-    cw.write_chunk_with_children(W2.MoveableBone, _inner)
-
-
-def _write_animation(cw: ChunkWriter, anim: dict):
-    """Write a single animation chunk (W2Ani3)."""
-    def _inner():
-        write_leb128_unsigned(cw.stream, anim.get('state_id', 0))
-        write_leb128_unsigned(cw.stream, anim.get('end_frame', 0))
-        write_leb128_unsigned(cw.stream, anim.get('frame_rate', 1))
-        write_leb128_unsigned(cw.stream, anim.get('next_animation', 0))
-        write_leb128_unsigned(cw.stream, anim.get('next_frame', 0))
-
-        # Blend frame count (new in Animation3 format)
-        write_leb128_unsigned(cw.stream, 0)
-
-        # Blend curves (start, end, handles) — default linear
-        cw.write_chunk_vector2(W2.CurveStart, (0.0, 0.0))
-        cw.write_chunk_vector2(W2.CurveEnd, (1.0, 1.0))
-        cw.write_chunk_vector2(W2.CurveStartHandle, (0.25, 0.25))
-        cw.write_chunk_vector2(W2.CurveEndHandle, (0.75, 0.75))
-
-        # Animation name
-        cw.write_chunk_string(W2.AnimationName, anim.get('name', ''))
-
-        # Keyframes
-        for kf in anim.get('keyframes', []):
-            _write_keyframe(cw, kf)
-
-        # State changes
-        for state_id, dispatches in anim.get('state_changes', {}).items():
-            _write_state_change(cw, state_id, dispatches)
-
-        # Anim commands
-        for cmd in anim.get('commands', []):
-            _write_anim_command(cw, cmd)
-
-        # Velocities: (startVel, endVel, startLateral, endLateral)
-        vel = anim.get('velocity', (0.0, 0.0, 0.0, 0.0))
-        cw.write_chunk_vector4(W2.AnimationVelocities, vel)
-
-    cw.write_chunk_with_children(W2.Animation, _inner)
-
-
-def _write_keyframe(cw: ChunkWriter, kf: dict):
-    def _inner():
-        offset = kf.get('offset', (0, 0, 0))
-        cw.write_chunk_vector3(W2.KeyFrameOffset, offset)
-
-        bbox = kf.get('bbox', {})
-        def _bbox():
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMin, bbox.get('min', (-100, -100, -100)))
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMax, bbox.get('max', (100, 100, 100)))
-        cw.write_chunk_with_children(W2.KeyFrameBoundingBox, _bbox)
-
-        for rot in kf.get('rotations', []):
-            # Rotations stored as euler angles (x, y, z) in radians
-            if len(rot) == 4:
-                # Quaternion (w, x, y, z) — convert to euler
-                w, x, y, z = rot
-                # Simple quaternion to euler (XYZ order)
-                sinr_cosp = 2 * (w * x + y * z)
-                cosr_cosp = 1 - 2 * (x * x + y * y)
-                rx = math.atan2(sinr_cosp, cosr_cosp)
-
-                sinp = 2 * (w * y - z * x)
-                sinp = max(-1.0, min(1.0, sinp))
-                ry = math.asin(sinp)
-
-                siny_cosp = 2 * (w * z + x * y)
-                cosy_cosp = 1 - 2 * (y * y + z * z)
-                rz = math.atan2(siny_cosp, cosy_cosp)
-
-                cw.write_chunk_vector3(W2.KeyFrameAngle, (
-                    math.degrees(rx), math.degrees(ry), math.degrees(rz)
-                ))
-            elif len(rot) == 3:
-                cw.write_chunk_vector3(W2.KeyFrameAngle, rot)
-            else:
-                cw.write_chunk_vector3(W2.KeyFrameAngle, (0, 0, 0))
-
-    cw.write_chunk_with_children(W2.KeyFrame, _inner)
-
-
-def _write_state_change(cw: ChunkWriter, state_id, dispatches):
-    def _inner():
-        write_leb128_unsigned(cw.stream, state_id)
-        for d in dispatches:
-            _write_dispatch(cw, d)
-    cw.write_chunk_with_children(W2.StateChange, _inner)
-
-
-def _write_dispatch(cw: ChunkWriter, d):
-    def _inner():
-        if isinstance(d, dict):
-            write_leb128_unsigned(cw.stream, d.get('in_frame', 0))
-            write_leb128_unsigned(cw.stream, d.get('out_frame', 0))
-            write_leb128_unsigned(cw.stream, d.get('next_animation', 0))
-            write_leb128_unsigned(cw.stream, d.get('next_frame_low', 0))
-            write_leb128_unsigned(cw.stream, d.get('next_frame_high', 0))
-            write_leb128_unsigned(cw.stream, 0)  # blend frame count
-            cw.write_chunk_vector2(W2.CurveStart, (0.0, 0.0))
-            cw.write_chunk_vector2(W2.CurveEnd, (1.0, 1.0))
-            cw.write_chunk_vector2(W2.CurveStartHandle, (0.25, 0.25))
-            cw.write_chunk_vector2(W2.CurveEndHandle, (0.75, 0.75))
-        else:
-            # model.Dispatch tuple: (in_range, out_range, next_anim, frame_in)
-            write_leb128_unsigned(cw.stream, d[0] if len(d) > 0 else 0)
-            write_leb128_unsigned(cw.stream, d[1] if len(d) > 1 else 0)
-            write_leb128_unsigned(cw.stream, d[2] if len(d) > 2 else 0)
-            write_leb128_unsigned(cw.stream, d[3] if len(d) > 3 else 0)
-            write_leb128_unsigned(cw.stream, 0)  # next_frame_high
-            write_leb128_unsigned(cw.stream, 0)  # blend frame count
-            cw.write_chunk_vector2(W2.CurveStart, (0.0, 0.0))
-            cw.write_chunk_vector2(W2.CurveEnd, (1.0, 1.0))
-            cw.write_chunk_vector2(W2.CurveStartHandle, (0.25, 0.25))
-            cw.write_chunk_vector2(W2.CurveEndHandle, (0.75, 0.75))
-    cw.write_chunk_with_children(W2.Dispatch, _inner)
-
-
-def _write_anim_command(cw: ChunkWriter, cmd):
-    def _inner():
-        if isinstance(cmd, (list, tuple)):
-            write_leb128_unsigned(cw.stream, cmd[0] if len(cmd) > 0 else 0)
-            write_leb128_signed(cw.stream, cmd[1] if len(cmd) > 1 else 0)
-            write_leb128_signed(cw.stream, cmd[2] if len(cmd) > 2 else 0)
-            write_leb128_signed(cw.stream, cmd[3] if len(cmd) > 3 else 0)
-        else:
-            write_leb128_unsigned(cw.stream, 0)
-            write_leb128_signed(cw.stream, 0)
-            write_leb128_signed(cw.stream, 0)
-            write_leb128_signed(cw.stream, 0)
-        cw.write_chunk_int(W2.AnimCommandSoundInfo, -1)
-    cw.write_chunk_with_children(W2.AnimCommand, _inner)
-
-
-def _write_moveable(cw: ChunkWriter, moveable: dict, texture_map: Dict[int, int]):
-    """Write a single moveable with meshes, bones, and animations."""
-    def _inner():
-        write_leb128_unsigned(cw.stream, moveable['id'])
-
-        # Write meshes
-        for mesh in moveable.get('meshes', []):
-            _write_mesh(cw, mesh, texture_map)
-
-        # Skin mesh (optional)
-        skin = moveable.get('skin')
-        if skin:
-            def _skin():
-                _write_mesh(cw, skin, texture_map)
-            cw.write_chunk_with_children(W2.MoveableSkin, _skin)
-
-        # Bones
-        for i, bone in enumerate(moveable.get('bones', [])):
-            _write_bone(cw, bone, i)
-
-        # Animations
-        for anim in moveable.get('animations', []):
-            _write_animation(cw, anim)
-
-    cw.write_chunk_with_children(W2.Moveable, _inner)
-
-
-def _write_moveables(cw: ChunkWriter, moveables: List[dict], texture_map: Dict[int, int]):
-    def _inner():
         for mov in moveables:
-            _write_moveable(cw, mov, texture_map)
-    cw.write_chunk_with_children(W2.Moveables, _inner)
+            self.write_single_moveable(writer, mov, options)
+
+        writer.write_chunk_end()
+
+    def write_single_moveable(self, writer: ChunkWriter, mov: dict, options):
+        """Write a single moveable"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Moveable)
+        buf = writer.get_current_buffer()
+
+        # Write moveable ID first (compact format)
+        write_leb128_uint(buf, mov.get('id', 0))
+
+        scale = options.get('scale', 512.0)
+
+        # Write embedded meshes
+        meshes = mov.get('meshes', [])
+        for mesh in meshes:
+            self.write_single_mesh(writer, mesh, options)
+
+        # Write bones using compact format
+        bones = mov.get('bones', [])
+        for bone in bones:
+            self.write_bone_compact(writer, bone, scale)
+
+        # Write animations using compact format
+        animations = mov.get('animations', [])
+        for anim in animations:
+            self.write_animation_compact(writer, anim, scale)
+
+        writer.write_chunk_end()
+
+    def write_bone_compact(self, writer: ChunkWriter, bone: dict, scale: float):
+        """Write a bone in compact W2Bone2 format"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Bone2)
+        buf = writer.get_current_buffer()
+
+        # Write op code
+        buf.write(struct.pack('B', bone.get('op', 0)))
+
+        # Write name (length-prefixed)
+        name = bone.get('name', '')
+        name_bytes = name.encode('utf-8')
+        buf.write(struct.pack('<I', len(name_bytes)))
+        buf.write(name_bytes)
+
+        # Write translation sub-chunk
+        translation = bone.get('translation', (0, 0, 0))
+        wad_trans = _fix_axis_to_wad2((translation[0] * scale, translation[1] * scale, translation[2] * scale))
+
+        # Inline sub-chunk: translation
+        write_chunk_id(buf, wad2_chunks.ChunkId.BoneTrans)
+        write_leb128_uint(buf, 12)  # 3 floats * 4 bytes
+        write_vector3(buf, wad_trans)
+
+        # Write mesh index sub-chunk if present
+        mesh_idx = bone.get('mesh', -1)
+        if mesh_idx >= 0:
+            write_chunk_id(buf, wad2_chunks.ChunkId.BoneMesh)
+            # Calculate LEB128 size for mesh index
+            mesh_buf = io.BytesIO()
+            write_leb128_uint(mesh_buf, mesh_idx)
+            mesh_data = mesh_buf.getvalue()
+            write_leb128_uint(buf, len(mesh_data))
+            buf.write(mesh_data)
+
+        writer.write_chunk_end()
+
+    def write_animation_compact(self, writer: ChunkWriter, anim: dict, scale: float):
+        """Write an animation in compact W2Ani2 format (matching Wad2Writer.cs)"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Ani2)
+        buf = writer.get_current_buffer()
+
+        # Write header fields (order matches Wad2Writer.cs)
+        write_leb128_uint(buf, anim.get('state_id', 0))
+        write_leb128_uint(buf, anim.get('end_frame', 0))
+        write_leb128_uint(buf, anim.get('frame_rate', 1))
+        write_leb128_uint(buf, anim.get('next_animation', 0))
+        write_leb128_uint(buf, anim.get('next_frame', 0))
+
+        # Write name sub-chunk if present
+        name = anim.get('name', '')
+        if name:
+            writer.write_chunk_string(wad2_chunks.ChunkId.AnmName, name)
+
+        # Write keyframes
+        keyframes = anim.get('keyframes', [])
+        for kf in keyframes:
+            self.write_keyframe_compact(writer, kf, scale)
+
+        # Write state changes
+        state_changes = anim.get('state_changes', {})
+        for state_id, dispatches in state_changes.items():
+            self.write_state_change_compact(writer, state_id, dispatches)
+
+        # Write commands
+        commands = anim.get('commands', [])
+        for cmd in commands:
+            self.write_command_compact(writer, cmd)
+
+        # Write velocity at the END (matching Wad2Writer.cs)
+        velocity = anim.get('velocity', (0.0, 0.0, 0.0, 0.0))
+        if isinstance(velocity, (tuple, list)) and len(velocity) >= 4:
+            writer.write_chunk_start(wad2_chunks.ChunkId.AniV)
+            write_vector4(writer.get_current_buffer(), (
+                float(velocity[0]),
+                float(velocity[1]),
+                float(velocity[2]),
+                float(velocity[3])
+            ))
+            writer.write_chunk_end()
+
+        writer.write_chunk_end()
+
+    def write_keyframe_compact(self, writer: ChunkWriter, kf: dict, scale: float):
+        """Write a keyframe in compact format
+
+        Format (W2Kf):
+        - W2KfOffs sub-chunk: vector3 offset
+        - W2KfBB sub-chunk (optional): contains W2BBMin and W2BBMax
+        - W2KfA sub-chunks: one per bone rotation (vector3 angles in degrees)
+        """
+        writer.write_chunk_start(wad2_chunks.ChunkId.Kf)
+
+        # Write offset sub-chunk
+        offset = kf.get('offset', (0, 0, 0))
+        wad_offset = _fix_axis_to_wad2((offset[0] * scale, offset[1] * scale, offset[2] * scale))
+        writer.write_chunk_vector3(wad2_chunks.ChunkId.KfOffs, wad_offset)
+
+        # Write bounding box if present
+        bbox = kf.get('bbox')
+        if bbox:
+            writer.write_chunk_start(wad2_chunks.ChunkId.KfBB)
+            bbox_min = bbox.get('min', (0, 0, 0))
+            bbox_max = bbox.get('max', (0, 0, 0))
+            # Convert to WAD2 coordinates
+            wad_bbox_min = _fix_axis_to_wad2((bbox_min[0] * scale, bbox_min[1] * scale, bbox_min[2] * scale))
+            wad_bbox_max = _fix_axis_to_wad2((bbox_max[0] * scale, bbox_max[1] * scale, bbox_max[2] * scale))
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMin, wad_bbox_min)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMax, wad_bbox_max)
+            writer.write_chunk_end()
+
+        # Write rotation angles - each as a separate W2KfA sub-chunk
+        rotations = kf.get('rotations', [])
+        for rot in rotations:
+            # Convert quaternion to euler angles in degrees
+            if len(rot) == 4:
+                # Quaternion format (w, x, y, z)
+                yaw, pitch, roll = _quat_to_euler_ypr(rot)
+                # WAD2 stores as (X rotation, Y rotation, Z rotation) in degrees
+                # which maps to (pitch, yaw, roll)
+                writer.write_chunk_vector3(wad2_chunks.ChunkId.KfA, (pitch, yaw, roll))
+            elif len(rot) == 3:
+                # Already euler angles (degrees)
+                writer.write_chunk_vector3(wad2_chunks.ChunkId.KfA, rot)
+
+        writer.write_chunk_end()
+
+    def write_state_change_compact(self, writer: ChunkWriter, state_id: int, dispatches: List):
+        """Write a state change in compact format"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.StCh)
+        buf = writer.get_current_buffer()
+
+        write_leb128_uint(buf, state_id)
+
+        for dispatch in dispatches:
+            writer.write_chunk_start(wad2_chunks.ChunkId.Disp)
+            disp_buf = writer.get_current_buffer()
+
+            if isinstance(dispatch, (tuple, list)) and len(dispatch) >= 4:
+                write_leb128_uint(disp_buf, dispatch[0])  # in_frame
+                write_leb128_uint(disp_buf, dispatch[1])  # out_frame
+                write_leb128_uint(disp_buf, dispatch[2])  # next_anim
+                write_leb128_uint(disp_buf, dispatch[3])  # next_frame
+            else:
+                # Default values
+                write_leb128_uint(disp_buf, 0)
+                write_leb128_uint(disp_buf, 0)
+                write_leb128_uint(disp_buf, 0)
+                write_leb128_uint(disp_buf, 0)
+
+            writer.write_chunk_end()
+
+        writer.write_chunk_end()
+
+    def write_command_compact(self, writer: ChunkWriter, cmd: tuple):
+        """Write an animation command in compact format"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Cmd2)
+        buf = writer.get_current_buffer()
+
+        if isinstance(cmd, (tuple, list)) and len(cmd) >= 4:
+            write_leb128_uint(buf, cmd[0])  # cmd_type
+            write_leb128_int(buf, cmd[1])   # param1
+            write_leb128_int(buf, cmd[2])   # param2
+            write_leb128_int(buf, cmd[3])   # param3
+        else:
+            write_leb128_uint(buf, 0)
+            write_leb128_int(buf, 0)
+            write_leb128_int(buf, 0)
+            write_leb128_int(buf, 0)
+
+        writer.write_chunk_end()
+
+    def write_statics(self, writer: ChunkWriter, statics: List[dict], options):
+        """Write static objects"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Statics)
+
+        for static in statics:
+            self.write_single_static(writer, static, options)
+
+        writer.write_chunk_end()
+
+    def write_single_static(self, writer: ChunkWriter, static: dict, options):
+        """Write a single static"""
+        writer.write_chunk_start(wad2_chunks.ChunkId.Static2)
+        buf = writer.get_current_buffer()
+
+        scale = options.get('scale', 512.0)
+
+        # Write static ID
+        write_leb128_uint(buf, static.get('id', 0))
+
+        # Write flags
+        write_leb128_uint(buf, static.get('flags', 0))
+
+        # Write embedded mesh
+        mesh = static.get('mesh')
+        if mesh:
+            self.write_single_mesh(writer, mesh, options)
+
+        # Write visibility box as container chunk with min/max sub-chunks
+        visibility_box = static.get('visibility_box')
+        if visibility_box:
+            bbox_min = visibility_box.get('min', (0, 0, 0))
+            bbox_max = visibility_box.get('max', (0, 0, 0))
+            wad_min = _fix_axis_to_wad2((bbox_min[0] * scale, bbox_min[1] * scale, bbox_min[2] * scale))
+            wad_max = _fix_axis_to_wad2((bbox_max[0] * scale, bbox_max[1] * scale, bbox_max[2] * scale))
+
+            writer.write_chunk_start(wad2_chunks.ChunkId.StaticVisibilityBox)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMin, wad_min)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMax, wad_max)
+            writer.write_chunk_end()
+
+        # Write collision box as container chunk with min/max sub-chunks
+        collision_box = static.get('collision_box')
+        if collision_box:
+            bbox_min = collision_box.get('min', (0, 0, 0))
+            bbox_max = collision_box.get('max', (0, 0, 0))
+            wad_min = _fix_axis_to_wad2((bbox_min[0] * scale, bbox_min[1] * scale, bbox_min[2] * scale))
+            wad_max = _fix_axis_to_wad2((bbox_max[0] * scale, bbox_max[1] * scale, bbox_max[2] * scale))
+
+            writer.write_chunk_start(wad2_chunks.ChunkId.StaticCollisionBox)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMin, wad_min)
+            writer.write_chunk_vector3(wad2_chunks.ChunkId.MeshBBMax, wad_max)
+            writer.write_chunk_end()
+
+        writer.write_chunk_end()
 
 
-def _write_static(cw: ChunkWriter, static: dict, texture_map: Dict[int, int]):
-    """Write a single static object (W2Static2)."""
-    def _inner():
-        write_leb128_unsigned(cw.stream, static['id'])
-        write_leb128_unsigned(cw.stream, static.get('flags', 0))
-
-        _write_mesh(cw, static['mesh'], texture_map)
-
-        cw.write_chunk_int(W2.StaticAmbientLight, static.get('ambient_light', 0))
-        cw.write_chunk_bool(W2.StaticShatter, static.get('shatter', False))
-        cw.write_chunk_int(W2.StaticShatterSound, static.get('shatter_sound', 0))
-
-        # Lights (optional)
-        for light in static.get('lights', []):
-            def _light():
-                cw.write_chunk_vector3(W2.StaticLightPosition, light.get('position', (0, 0, 0)))
-                cw.write_chunk_float(W2.StaticLightRadius, light.get('radius', 1.0))
-                cw.write_chunk_float(W2.StaticLightIntensity, light.get('intensity', 0.5))
-            cw.write_chunk_with_children(W2.StaticLight, _light)
-
-        # Visibility box
-        vis_box = static.get('visibility_box', {})
-        def _vis():
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMin, vis_box.get('min', (0, 0, 0)))
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMax, vis_box.get('max', (0, 0, 0)))
-        cw.write_chunk_with_children(W2.StaticVisibilityBox, _vis)
-
-        # Collision box
-        col_box = static.get('collision_box', vis_box)
-        def _col():
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMin, col_box.get('min', (0, 0, 0)))
-            cw.write_chunk_vector3(W2.MeshBoundingBoxMax, col_box.get('max', (0, 0, 0)))
-        cw.write_chunk_with_children(W2.StaticCollisionBox, _col)
-
-    cw.write_chunk_with_children(W2.Static, _inner)
-
-
-def _write_statics(cw: ChunkWriter, statics: List[dict], texture_map: Dict[int, int]):
-    def _inner():
-        for s in statics:
-            _write_static(cw, s, texture_map)
-    cw.write_chunk_with_children(W2.Statics, _inner)
-
-
-def _write_metadata(cw: ChunkWriter, game_version: str = 'TR4'):
-    """Write metadata: timestamp and user notes."""
-    import datetime
-    now = datetime.datetime.now()
-
-    def _inner():
-        def _timestamp():
-            write_leb128_unsigned(cw.stream, now.year)
-            write_leb128_unsigned(cw.stream, now.month)
-            write_leb128_unsigned(cw.stream, now.day)
-            write_leb128_unsigned(cw.stream, now.hour)
-            write_leb128_unsigned(cw.stream, now.minute)
-            write_leb128_unsigned(cw.stream, now.second)
-        cw.write_chunk_with_children(W2.Timestamp, _timestamp)
-        cw.write_chunk_string(W2.UserNotes, '')
-
-    cw.write_chunk_with_children(W2.Metadata, _inner)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def write_wad2(filepath: str, wad_data: dict, options: dict = None):
-    """Write a complete WAD2 file.
-
-    Parameters
-    ----------
-    filepath : str
-        Output .wad2 file path.
-    wad_data : dict
-        Keys: 'textures' (list of dict), 'moveables' (list of dict),
-              'statics' (list of dict).
-        Each texture dict: {width, height, data (BGRA bytes), name, rel_path}
-        Each moveable dict: {id, meshes, bones, animations, skin?}
-        Each static dict: {id, mesh, visibility_box, collision_box, flags}
-    options : dict, optional
-        Keys: 'game' (str), 'scale' (float).
-    """
-    if options is None:
-        options = {}
-
-    game = options.get('game', 'TR4')
-    textures = wad_data.get('textures', [])
-    moveables = wad_data.get('moveables', [])
-    statics = wad_data.get('statics', [])
-
-    # Build texture map: material_index -> WAD2 texture table index
-    texture_map = {}
-    for i, tex in enumerate(textures):
-        texture_map[tex.get('index', i)] = i
-
-    # Write to memory first, then save (same strategy as C# writer)
-    buf = io.BytesIO()
-
-    # Magic number: WAD2
-    buf.write(b'WAD2')
-
-    # Compression type: 0 = None (matches C# ChunkWriter.Compression.None)
-    buf.write(struct.pack('<I', 0))
-
-    cw = ChunkWriter(buf)
-
-    # Game version
-    game_ver = GAME_VERSIONS.get(game, 3)  # Default TR4
-    cw.write_chunk_int(W2.GameVersion, game_ver)
-
-    # Sound system: XML = 1
-    cw.write_chunk_int(W2.SoundSystem, 1)
-
-    # Textures
-    _write_textures(cw, textures)
-
-    # Sprites (empty)
-    cw.write_chunk_with_children(W2.Sprites, lambda: None)
-
-    # Sprite sequences (empty)
-    cw.write_chunk_with_children(W2.SpriteSequences, lambda: None)
-
-    # Moveables
-    _write_moveables(cw, moveables, texture_map)
-
-    # Statics
-    _write_statics(cw, statics, texture_map)
-
-    # Metadata
-    _write_metadata(cw, game)
-
-    # Animated texture sets (empty)
-    cw.write_chunk_with_children(W2.AnimatedTextureSets, lambda: None)
-
-    # Final terminator (end of root)
-    cw._write_chunk_end()
-
-    # Write to file
-    with open(filepath, 'wb') as f:
-        f.write(buf.getvalue())
-
-    print(f"[WAD2 Export] Written {len(buf.getvalue())} bytes to {filepath}")
-    print(f"[WAD2 Export] {len(textures)} textures, {len(moveables)} moveables, {len(statics)} statics")
+def write_wad2(filepath: str, wad_data: dict, options: dict):
+    """Write a WAD2 file"""
+    writer = Wad2Writer()
+    writer.write(filepath, wad_data, options)

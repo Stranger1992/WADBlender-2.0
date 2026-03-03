@@ -229,26 +229,6 @@ def read_leb128_uint_from(data: bytes, offset: int) -> Tuple[Optional[int], int]
     return result, offset
 
 
-def read_leb128_int_from(data: bytes, offset: int) -> Tuple[Optional[int], int]:
-    """Read LEB128 variable-length signed integer from bytes buffer."""
-    result = 0
-    shift = 0
-    byte = 0
-    while True:
-        if offset >= len(data):
-            return None, offset
-        byte = data[offset]
-        offset += 1
-        result |= (byte & 0x7F) << shift
-        shift += 7
-        if (byte & 0x80) == 0:
-            break
-    # Sign extend if necessary
-    if shift < 64 and (byte & 0x40):
-        result |= -(1 << shift)
-    return result, offset
-
-
 def read_chunk_id_from(data: bytes, offset: int) -> Tuple[Optional[bytes], int]:
     length, offset = read_leb128_uint_from(data, offset)
     if length is None or length == 0:
@@ -659,24 +639,19 @@ class Wad2Loader:
             if chunk_id is None:
                 break
 
-            # W2Tr2/W2Uq2 have ParentArea; W2Tr/W2Uq do not.
-            # The verbose names (MeshTriangles/MeshQuads) are from an older
-            # format and also lack ParentArea.
-            is_v2 = chunk_id in (wad2_chunks.ChunkId.MeshTri2,
-                                  wad2_chunks.ChunkId.MeshQuad2)
-
+            # Handle both verbose and compact chunk IDs
             if chunk_id in (wad2_chunks.ChunkId.MeshTriangles,
                             wad2_chunks.ChunkId.MeshTri2,
                             wad2_chunks.ChunkId.MeshTri):
                 data = stream.read(reader.get_chunk_size())
-                poly = self._parse_polygon_chunk(data, 3, max_vertex_index, has_parent_area=is_v2)
+                poly = self._parse_polygon_chunk(data, 3, max_vertex_index)
                 if poly:
                     mesh['triangles'].append(poly)
             elif chunk_id in (wad2_chunks.ChunkId.MeshQuads,
                               wad2_chunks.ChunkId.MeshQuad2,
                               wad2_chunks.ChunkId.MeshQuad):
                 data = stream.read(reader.get_chunk_size())
-                poly = self._parse_polygon_chunk(data, 4, max_vertex_index, has_parent_area=is_v2)
+                poly = self._parse_polygon_chunk(data, 4, max_vertex_index)
                 if poly:
                     mesh['quads'].append(poly)
 
@@ -689,20 +664,8 @@ class Wad2Loader:
 
     def _parse_polygon_chunk(self, data: bytes, vertex_count: int, max_vertex_index: int,
                              has_parent_area: Optional[bool] = None) -> Optional[dict]:
-        """Parse a single polygon chunk (W2Tr/W2Uq/W2Tr2/W2Uq2).
-        
-        Binary format (from Wad2Loader.cs / Wad2Writer.cs):
-          - vertex_count x LEB128 indices
-          - LEB128 shine_strength
-          - LEB128 texture_idx
-          - [if W2Tr2/W2Uq2] ParentArea: 2x Vector2 (4 floats = 16 bytes)
-          - vertex_count x Vector2 UV coords (each 8 bytes)
-          - LEB128 signed blend_mode
-          - 1 byte boolean double_sided
-        """
+        """Parse a single polygon chunk (W2Tr/W2Uq/W2Tr2/W2Uq2)."""
         offset = 0
-
-        # Read vertex indices (LEB128 unsigned)
         indices: List[int] = []
         for _ in range(vertex_count):
             idx, offset = read_leb128_uint_from(data, offset)
@@ -710,34 +673,30 @@ class Wad2Loader:
                 return None
             indices.append(idx)
 
-        # Read shine strength (LEB128 unsigned - matches LEB128.ReadByte in C#)
         shine_strength, offset = read_leb128_uint_from(data, offset)
         if shine_strength is None:
             return None
 
-        # Read texture index (LEB128 signed int in C#, but always >= 0)
         texture_idx, offset = read_leb128_uint_from(data, offset)
         if texture_idx is None:
             return None
 
-        # Read ParentArea if this is a v2 chunk (W2Tr2/W2Uq2)
-        # has_parent_area should be set by the caller based on chunk ID
+        uv_bytes = vertex_count * 8
+        remaining = len(data) - offset
         if has_parent_area is None:
-            # Fallback heuristic for unknown chunk types
-            uv_bytes = vertex_count * 8  # UVs: vertex_count * 2 floats * 4 bytes
-            remaining = len(data) - offset
-            # Minimum after UVs: 1 byte LEB128 blend + 1 byte bool = 2
-            # With parent area: + 16 bytes
-            has_parent_area = remaining >= uv_bytes + 16 + 2
+            if remaining in (uv_bytes + 16 + 3, uv_bytes + 16 + 2):
+                has_parent_area = True
+            elif remaining in (uv_bytes + 3, uv_bytes + 2):
+                has_parent_area = False
+            else:
+                has_parent_area = remaining >= uv_bytes + 16 + 2
 
         if has_parent_area:
-            # ParentArea.Start (Vector2) + ParentArea.End (Vector2) = 16 bytes
-            if offset + 16 > len(data):
+            _, offset = self._read_vector2_from(data, offset)
+            _, offset = self._read_vector2_from(data, offset)
+            if offset > len(data):
                 return None
-            # We skip parent area for now, just advance offset
-            offset += 16
 
-        # Read UV coordinates: vertex_count x Vector2
         uvs = []
         for _ in range(vertex_count):
             uv, offset = self._read_vector2_from(data, offset)
@@ -745,18 +704,24 @@ class Wad2Loader:
                 return None
             uvs.append(uv)
 
-        # Read BlendMode as LEB128 signed long (matches C#: (BlendMode)LEB128.ReadLong)
         blend_mode = 0
         double_sided = False
-        if offset < len(data):
-            blend_mode, offset = read_leb128_int_from(data, offset)
-            if blend_mode is None:
-                blend_mode = 0
+        remaining = len(data) - offset
+        if remaining >= 3:
+            blend_mode = struct.unpack_from('<h', data, offset)[0]
+            double_sided = bool(data[offset + 2])
+            offset += 3
+        else:
+            blend_mode_val, offset2 = read_leb128_uint_from(data, offset)
+            if blend_mode_val is not None:
+                blend_mode = blend_mode_val
+                offset = offset2
+                if offset < len(data):
+                    double_sided = bool(data[offset])
+                    offset += 1
 
-        # Read DoubleSided as boolean byte (matches C#: chunkIO.Raw.ReadBoolean())
-        if offset < len(data):
-            double_sided = bool(data[offset])
-            offset += 1
+        if offset > len(data):
+            return None
 
         return {
             'indices': indices,
@@ -1504,35 +1469,23 @@ class Wad2Loader:
             indices = indices + [0] * (vertex_count - len(indices))
         face = tuple(indices[:vertex_count])
 
-        # Determine the actual texture dimensions for this polygon's texture.
-        # WAD2 textures can have different sizes (e.g. 4x4 solid colours and
-        # 256x256 detail textures in the same file).  UVs are stored in pixel
-        # coordinates and must be normalised against the correct page size.
-        texture_idx = poly_data.get('texture', 0)
-        tex_w = mapwidth
-        tex_h = mapheight
-        if self.textures and texture_idx in self.textures:
-            tex_info = self.textures[texture_idx]
-            tex_w = max(1, tex_info.get('width', mapwidth))
-            tex_h = max(1, tex_info.get('height', mapheight))
-
-        # Texture coordinates (UV) — stored as pixel positions, normalise to 0-1
+        # Texture coordinates (UV)
         uvs = poly_data.get('uvs', [])
         if len(uvs) < vertex_count:
             uvs = uvs + [(0.0, 0.0)] * (vertex_count - len(uvs))
         tbox = []
         for i in range(vertex_count):
             u, v = uvs[i]
-            if tex_w > 0 and tex_h > 0:
-                u = max(0.0, min(1.0, u / tex_w))
-                v = max(0.0, min(1.0, v / tex_h))
+            if mapwidth > 0 and mapheight > 0:
+                u = max(0.0, min(1.0, u / mapwidth))
+                v = max(0.0, min(1.0, v / mapheight))
                 v = 1.0 - v
             else:
                 u, v = 0.0, 0.0
             tbox.append((u, v))
 
         # Texture page and coordinates
-        # texture_idx already set above
+        texture_idx = poly_data.get('texture', 0)
 
         # WAD2 textures are standalone; map texture index to page.
         texture_count = len(self.textures)
@@ -1561,8 +1514,6 @@ class Wad2Loader:
         )
         poly.texture_index = texture_idx
         poly.texture_flipped = 1 if poly_data.get('flipped', False) else 0
-        poly.blend_mode = poly_data.get('blend_mode', 0)
-        poly.double_sided = poly_data.get('double_sided', False)
         return poly
 
     def _convert_animation_to_model(self, anim_data: dict):

@@ -22,8 +22,6 @@ class Polygon:
     origin: int
     x: int
     y: int
-    blend_mode: int = 0
-    double_sided: bool = False
 
 
 @dataclass

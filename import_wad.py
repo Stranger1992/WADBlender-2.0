@@ -131,27 +131,6 @@ class ImportWAD(Operator, ImportHelper):
         default='OPT_FULL',
     )
 
-    # WAD2-specific texture mode
-    texture_type_wad2: EnumProperty(
-        name="Import mode",
-        description="",
-        items=(
-            ('OPT_PACKED', "Packed (one texture per object)",
-             "Each object gets a single packed texture containing only its used regions."),
-            ('OPT_PAGES', "Texture Pages",
-             "Individual texture pages are shared across all objects (original WAD2 textures)"),
-        ),
-        default='OPT_PACKED',
-    )
-
-    texture_padding: IntProperty(
-        name="Texture Padding",
-        description="Pixels of padding and bleed between packed texture regions. Higher values prevent seam artifacts in mipmaps and normal maps",
-        default=4,
-        min=0,
-        max=8
-    )
-
     scale_setting: IntProperty(
         name="Scale",
         description="Dividing by 512, one TRLE click becomes 0.5 meters",
@@ -279,16 +258,7 @@ class ImportWAD(Operator, ImportHelper):
         row = box.label(text='Materials:')
 
         col = box.column()
-
-        # Show appropriate texture mode selector based on file type
-        is_wad2 = self.filepath.lower().endswith('.wad2')
-        if is_wad2:
-            # Always show WAD2 selector - libs are checked at import time
-            col.prop(self, "texture_type_wad2", expand=True)
-            if self.texture_type_wad2 == 'OPT_PACKED':
-                row = box.row(align=True)
-                row.prop(self, "texture_padding")
-        elif ImportWADContext.has_numpy:
+        if ImportWADContext.has_numpy:
             col.prop(self, "texture_type", expand=True)
         else:
             col.prop(self, "texture_type_nolib", expand=True)
@@ -353,6 +323,14 @@ class ImportWAD(Operator, ImportHelper):
         else:
             options.anim_names = ImportWADContext.anim_names[self.anims_names_opt]
 
+        # Set texture options based on numpy availability
+        if ImportWADContext.has_numpy:
+            options.one_material_per_object = self.texture_type == 'OPT_OBJECT'
+            options.texture_pages = self.texture_type == 'OPT_PAGES'
+        else:
+            options.one_material_per_object = False
+            options.texture_pages = False
+
         # Detect WAD format
         if self.wad_format == 'AUTO':
             is_wad2 = options.filepath.lower().endswith('.wad2')
@@ -362,39 +340,6 @@ class ImportWAD(Operator, ImportHelper):
             is_wad2 = False
 
         options.is_wad2 = is_wad2
-
-        # Set texture options
-        if is_wad2:
-            # Check numpy availability at runtime (the class-level check
-            # can be stale if libraries were installed after addon load).
-            # PIL is optional - we fall back to Blender's image API if missing.
-            try:
-                import numpy
-                has_numpy_rt = True
-            except ImportError:
-                has_numpy_rt = False
-
-            if has_numpy_rt:
-                options.wad2_pack_textures = self.texture_type_wad2 == 'OPT_PACKED'
-                options.texture_padding = self.texture_padding
-                options.texture_pages = True  # Always need pages loaded for WAD2
-                options.one_material_per_object = False
-            else:
-                options.wad2_pack_textures = False
-                options.texture_pages = True
-                options.one_material_per_object = False
-            print(f"[WAD2 Options] wad2_pack_textures={options.wad2_pack_textures}, "
-                  f"texture_type_wad2={self.texture_type_wad2}, "
-                  f"has_numpy_rt={has_numpy_rt}")
-        else:
-            options.wad2_pack_textures = False
-            if ImportWADContext.has_numpy:
-                options.one_material_per_object = self.texture_type == 'OPT_OBJECT'
-                options.texture_pages = self.texture_type == 'OPT_PAGES'
-            else:
-                options.one_material_per_object = False
-                options.texture_pages = False
-
         return options
 
     def _load_wad_file(self, options):
@@ -409,17 +354,6 @@ class ImportWAD(Operator, ImportHelper):
     def _setup_materials(self, context, wad, options):
         """Create or load materials for the WAD textures."""
         materials = []
-
-        if options.is_wad2 and options.wad2_pack_textures:
-            # WAD2 packed mode: we still need to save the page textures
-            # so the packer can read them, but we don't create per-page
-            # materials here. Instead, pack_wad2_textures() in
-            # create_materials.py handles material creation per-object.
-            # We just need to ensure the page data is available on `wad`.
-            #
-            # Return empty materials list — pack_wad2_textures() will
-            # create the material when called per-object.
-            return materials
 
         if options.texture_pages:
             first_page_name = f'{options.wadname}_PAGE0'
@@ -528,20 +462,15 @@ class ImportWAD(Operator, ImportHelper):
     def execute(self, context):
         options = self._create_options()
 
-        # Apply WAD2-specific settings (for non-packed mode)
-        if options.is_wad2 and not options.wad2_pack_textures:
-            options.flip_normals = True
-
-        # Always flip normals for WAD2
+        # Apply WAD2-specific settings
         if options.is_wad2:
+            if options.one_material_per_object:
+                self.report({'INFO'}, "WAD2 import uses texture pages; per-object packing is disabled.")
+            options.one_material_per_object = False
+            options.texture_pages = True
             options.flip_normals = True
 
         wad = self._load_wad_file(options)
-
-        # Store wad on options so pack_wad2_textures can access texture data
-        if options.is_wad2 and options.wad2_pack_textures:
-            options.wad = wad
-
         materials = self._setup_materials(context, wad, options)
         self._import_objects(context, materials, wad, options)
 
