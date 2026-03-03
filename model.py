@@ -22,7 +22,7 @@ class Polygon:
     origin: int
     x: int
     y: int
-    blend_mode: int = 0
+    blend_mode: int = 0       # 0=opaque, 1=alpha test, 2=additive
     double_sided: bool = False
 
 
