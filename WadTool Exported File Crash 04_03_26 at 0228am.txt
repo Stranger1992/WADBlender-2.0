@@ -1,0 +1,35 @@
+[02:26:40.739  INFO] WadTool.WadActions | Unable to load source file from 'C:\Users\danie\OneDrive\Desktop\Mummy_roundtrip.wad2'. | System.ArgumentOutOfRangeException
+
+Non-negative number required. (Parameter 'count')
+
+   at System.IO.BinaryReader.ReadBytes(Int32 count)
+
+   at TombLib.IO.ChunkReader.ReadChunkArrayOfBytes(Int64 length) in C:\Github\Tomb-Editor\TombLib\TombLib\IO\ChunkReader.cs:line 122
+
+   at TombLib.Wad.Wad2Loader.<>c__DisplayClass5_1.<LoadTextures>b__1(ChunkId id2, Int64 chunkSize2) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2Loader.cs:line 244
+
+   at TombLib.IO.ChunkReader.ReadChunks(ReadChunkDelegate tryParseChunk) in C:\Github\Tomb-Editor\TombLib\TombLib\IO\ChunkReader.cs:line 84
+
+   at TombLib.Wad.Wad2Loader.<>c__DisplayClass5_0.<LoadTextures>b__0(ChunkId id, Int64 chunkSize) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2Loader.cs:line 235
+
+   at TombLib.IO.ChunkReader.ReadChunks(ReadChunkDelegate tryParseChunk) in C:\Github\Tomb-Editor\TombLib\TombLib\IO\ChunkReader.cs:line 84
+
+   at TombLib.Wad.Wad2Loader.LoadTextures(ChunkReader chunkIO, ChunkId idOuter, Wad2 wad, Dictionary`2& outTextures) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2Loader.cs:line 224
+
+   at TombLib.Wad.Wad2Loader.<>c__DisplayClass2_0.<LoadWad2>b__0(ChunkId id, Int64 chunkSize) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2Loader.cs:line 85
+
+   at TombLib.IO.ChunkReader.ReadChunks(ReadChunkDelegate tryParseChunk) in C:\Github\Tomb-Editor\TombLib\TombLib\IO\ChunkReader.cs:line 84
+
+   at TombLib.Wad.Wad2Loader.LoadWad2(ChunkReader chunkIO, String fileName) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2Loader.cs:line 70
+
+   at TombLib.Wad.Wad2Loader.LoadFromStream(Stream stream, String fileName) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2Loader.cs:line 57
+
+   at TombLib.Wad.Wad2Loader.LoadFromFile(String fileName, Boolean withSounds) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2Loader.cs:line 19
+
+   at TombLib.Wad.Wad2.ImportFromFile(String fileName, Boolean withSounds, IDialogHandler progressReporter, Boolean allowTRNGDecryption) in C:\Github\Tomb-Editor\TombLib\TombLib\Wad\Wad2.cs:line 125
+
+   at WadTool.WadActions.LoadWad(WadToolClass tool, IWin32Window owner, Boolean destination, String fileName) in C:\Github\Tomb-Editor\WadTool\WadActions.cs:line 41
+
+
+
+WadTool crashed on import and so I compiled a debug version and this is what it came out with.
