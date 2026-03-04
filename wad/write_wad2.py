@@ -206,7 +206,7 @@ class ChunkWriter:
         write_leb128_signed(buf, value)
         data = buf.getvalue()
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))   # minimal
+        write_leb128_signed(self.stream, len(data))
         self.stream.write(data)
 
     def write_chunk_string(self, chunk_id: bytes, text: str):
@@ -217,41 +217,41 @@ class ChunkWriter:
         buf.write(encoded)
         data = buf.getvalue()
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))   # minimal
+        write_leb128_signed(self.stream, len(data))
         self.stream.write(data)
 
     def write_chunk_float(self, chunk_id: bytes, value: float):
         """Write a chunk containing a single 32-bit float."""
         data = struct.pack('<f', value)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))   # minimal
+        write_leb128_signed(self.stream, len(data))
         self.stream.write(data)
 
     def write_chunk_vector3(self, chunk_id: bytes, x: float, y: float, z: float):
         """Write a chunk containing three 32-bit floats."""
         data = struct.pack('<fff', x, y, z)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))   # minimal
+        write_leb128_signed(self.stream, len(data))
         self.stream.write(data)
 
     def write_chunk_vector4(self, chunk_id: bytes, x: float, y: float, z: float, w: float):
         """Write a chunk containing four 32-bit floats."""
         data = struct.pack('<ffff', x, y, z, w)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))   # minimal
+        write_leb128_signed(self.stream, len(data))
         self.stream.write(data)
 
     def write_chunk_bool(self, chunk_id: bytes, value: bool):
         """Write a chunk containing a single boolean byte."""
         data = struct.pack('?', value)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))   # minimal
+        write_leb128_signed(self.stream, len(data))
         self.stream.write(data)
 
     def write_chunk_bytes(self, chunk_id: bytes, data: bytes):
         """Write a chunk containing raw byte data."""
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))   # minimal
+        write_leb128_signed(self.stream, len(data))
         self.stream.write(data)
 
     # -- Parent chunk helpers (with children) --
@@ -269,7 +269,7 @@ class ChunkWriter:
         if size_bytes is None:
             size_bytes = self.size_bytes
         buf = io.BytesIO()
-        child_writer = ChunkWriter(buf, size_bytes=self.size_bytes)
+        child_writer = ChunkWriter(buf, size_bytes=ChunkWriter.DEFAULT_SIZE_BYTES)
         write_fn(child_writer)
         child_writer._write_chunk_end_marker()
         data = buf.getvalue()
@@ -376,8 +376,8 @@ def _write_textures(cw: ChunkWriter, textures: list):
             def _tex_inner(tw, t=tex):
                 tw.write_raw_leb128_unsigned(t['width'])
                 tw.write_raw_leb128_unsigned(t['height'])
-                tw.write_chunk_string(Wad2Chunks.TextureName, t.get('name', ''))
-                tw.write_chunk_string(Wad2Chunks.TextureRelativePath, t.get('rel_path', ''))
+                tw.write_chunk_string(Wad2Chunks.TextureName, '')
+                tw.write_chunk_string(Wad2Chunks.TextureRelativePath, '')
                 tw.write_chunk_bytes(Wad2Chunks.TextureData, t['data'])
             w.write_chunk_with_children(Wad2Chunks.Texture, _tex_inner)
     # Textures chunk can be very large — use 5-byte LEB128 size
