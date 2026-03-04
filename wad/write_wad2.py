@@ -183,7 +183,7 @@ class ChunkWriter:
 
     def _write_chunk_id(self, chunk_id: bytes):
         """Write a chunk identifier (minimal LEB128-length-prefixed bytes)."""
-        write_leb128_unsigned(self.stream, len(chunk_id))
+        write_leb128_signed(self.stream, len(chunk_id))
         self.stream.write(chunk_id)
 
     def _write_size(self, size: int, num_bytes: int = None):
@@ -210,15 +210,11 @@ class ChunkWriter:
         self.stream.write(data)
 
     def write_chunk_string(self, chunk_id: bytes, text: str):
-        """Write a chunk containing a LEB128-length-prefixed UTF-8 string."""
+        """Write a chunk containing a raw UTF-8 string (no length prefix in body)."""
         encoded = text.encode('utf-8')
-        buf = io.BytesIO()
-        write_leb128_unsigned(buf, len(encoded))
-        buf.write(encoded)
-        data = buf.getvalue()
         self._write_chunk_id(chunk_id)
-        write_leb128_signed(self.stream, len(data))
-        self.stream.write(data)
+        write_leb128_signed(self.stream, len(encoded))
+        self.stream.write(encoded)
 
     def write_chunk_float(self, chunk_id: bytes, value: float):
         """Write a chunk containing a single 32-bit float."""
@@ -303,7 +299,7 @@ class ChunkWriter:
     def write_raw_string_utf8(self, text: str):
         """Write a LEB128-length-prefixed UTF-8 string (no chunk framing)."""
         encoded = text.encode('utf-8')
-        write_leb128_unsigned(self.stream, len(encoded))
+        write_leb128_signed(self.stream, len(encoded))
         self.stream.write(encoded)
 
     def write_raw_int32(self, value: int):
@@ -374,8 +370,8 @@ def _write_textures(cw: ChunkWriter, textures: list):
     def _inner(w):
         for tex in textures:
             def _tex_inner(tw, t=tex):
-                tw.write_raw_leb128_unsigned(t['width'])
-                tw.write_raw_leb128_unsigned(t['height'])
+                tw.write_raw_leb128_signed(t['width'])
+                tw.write_raw_leb128_signed(t['height'])
                 tw.write_chunk_string(Wad2Chunks.TextureName, '')
                 tw.write_chunk_string(Wad2Chunks.TextureRelativePath, '')
                 tw.write_chunk_bytes(Wad2Chunks.TextureData, t['data'])
@@ -462,9 +458,9 @@ def _write_mesh(cw: ChunkWriter, mesh: dict):
 
                 def _poly_inner(ppw, p=poly, q=is_quad):
                     for idx in p['indices']:
-                        ppw.write_raw_leb128_unsigned(idx)
-                    ppw.write_raw_leb128_unsigned(p.get('shine', 0))
-                    ppw.write_raw_leb128_unsigned(p.get('texture_index', 0))
+                        ppw.write_raw_leb128_signed(idx)
+                    ppw.write_raw_leb128_signed(p.get('shine', 0))
+                    ppw.write_raw_leb128_signed(p.get('texture_index', 0))
 
                     pa = p.get('parent_area', (0.0, 0.0, 1.0, 1.0))
                     ppw.write_raw_vector2(pa[0], pa[1])
@@ -490,14 +486,14 @@ def _write_moveables(cw: ChunkWriter, moveables: list):
     def _inner(w):
         for mov in moveables:
             def _mov_inner(mw, m=mov):
-                mw.write_raw_leb128_unsigned(m['id'])
+                mw.write_raw_leb128_signed(m['id'])
 
                 for mesh in m.get('meshes', []):
                     _write_mesh(mw, mesh)
 
                 for bone in m.get('bones', []):
                     def _bone_inner(bw, b=bone):
-                        bw.write_raw_leb128_unsigned(b.get('op', 0))
+                        bw.write_raw_leb128_signed(b.get('op', 0))
                         bw.write_raw_string_utf8(b.get('name', ''))
                         t = b.get('translation', (0, 0, 0))
                         bw.write_chunk_vector3(Wad2Chunks.MoveableBoneTranslation,
@@ -508,11 +504,11 @@ def _write_moveables(cw: ChunkWriter, moveables: list):
 
                 for anim in m.get('animations', []):
                     def _anim_inner(aw, a=anim):
-                        aw.write_raw_leb128_unsigned(a.get('state_id', 0))
-                        aw.write_raw_leb128_unsigned(a.get('end_frame', 0))
-                        aw.write_raw_leb128_unsigned(a.get('frame_rate', 1))
-                        aw.write_raw_leb128_unsigned(a.get('next_animation', 0))
-                        aw.write_raw_leb128_unsigned(a.get('next_frame', 0))
+                        aw.write_raw_leb128_signed(a.get('state_id', 0))
+                        aw.write_raw_leb128_signed(a.get('end_frame', 0))
+                        aw.write_raw_leb128_signed(a.get('frame_rate', 1))
+                        aw.write_raw_leb128_signed(a.get('next_animation', 0))
+                        aw.write_raw_leb128_signed(a.get('next_frame', 0))
 
                         aw.write_chunk_string(Wad2Chunks.AnimationName, a.get('name', ''))
 
@@ -536,19 +532,19 @@ def _write_moveables(cw: ChunkWriter, moveables: list):
 
                         for sc in a.get('state_changes', []):
                             def _sc_inner(sw, s=sc):
-                                sw.write_raw_leb128_unsigned(s['state_id'])
+                                sw.write_raw_leb128_signed(s['state_id'])
                                 for disp in s.get('dispatches', []):
                                     def _disp_inner(dw, d=disp):
-                                        dw.write_raw_leb128_unsigned(d['in_frame'])
-                                        dw.write_raw_leb128_unsigned(d['out_frame'])
-                                        dw.write_raw_leb128_unsigned(d['next_animation'])
-                                        dw.write_raw_leb128_unsigned(d['next_frame'])
+                                        dw.write_raw_leb128_signed(d['in_frame'])
+                                        dw.write_raw_leb128_signed(d['out_frame'])
+                                        dw.write_raw_leb128_signed(d['next_animation'])
+                                        dw.write_raw_leb128_signed(d['next_frame'])
                                     sw.write_chunk_with_children(Wad2Chunks.Dispatch, _disp_inner)
                             aw.write_chunk_with_children(Wad2Chunks.StateChange, _sc_inner)
 
                         for cmd in a.get('commands', []):
                             def _cmd_inner(cmdw, c=cmd):
-                                cmdw.write_raw_leb128_unsigned(c.get('type', 0))
+                                cmdw.write_raw_leb128_signed(c.get('type', 0))
                                 cmdw.write_raw_leb128_signed(c.get('param1', 0))
                                 cmdw.write_raw_leb128_signed(c.get('param2', 0))
                                 cmdw.write_raw_leb128_signed(c.get('param3', 0))
@@ -575,7 +571,7 @@ def _write_statics(cw: ChunkWriter, statics: list):
     def _inner(w):
         for static in statics:
             def _static_inner(sw, s=static):
-                sw.write_raw_leb128_unsigned(s['id'])
+                sw.write_raw_leb128_signed(s['id'])
                 sw.write_raw_leb128_signed(s.get('flags', 0))
 
                 _write_mesh(sw, s['mesh'])
@@ -613,12 +609,12 @@ def _write_metadata(cw: ChunkWriter, timestamp, user_notes: str):
     def _inner(w):
         if timestamp:
             def _ts(tw):
-                tw.write_raw_leb128_unsigned(timestamp[0])
-                tw.write_raw_leb128_unsigned(timestamp[1])
-                tw.write_raw_leb128_unsigned(timestamp[2])
-                tw.write_raw_leb128_unsigned(timestamp[3])
-                tw.write_raw_leb128_unsigned(timestamp[4])
-                tw.write_raw_leb128_unsigned(timestamp[5])
+                tw.write_raw_leb128_signed(timestamp[0])
+                tw.write_raw_leb128_signed(timestamp[1])
+                tw.write_raw_leb128_signed(timestamp[2])
+                tw.write_raw_leb128_signed(timestamp[3])
+                tw.write_raw_leb128_signed(timestamp[4])
+                tw.write_raw_leb128_signed(timestamp[5])
             w.write_chunk_with_children(Wad2Chunks.Timestamp, _ts)
         w.write_chunk_string(Wad2Chunks.UserNotes, user_notes or '')
     cw.write_chunk_with_children(Wad2Chunks.Metadata, _inner)
