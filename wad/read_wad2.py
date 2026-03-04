@@ -1469,6 +1469,18 @@ class Wad2Loader:
             indices = indices + [0] * (vertex_count - len(indices))
         face = tuple(indices[:vertex_count])
 
+        # Texture page and coordinates
+        texture_idx = poly_data.get('texture', 0)
+
+        # Use per-texture dimensions for UV normalisation.
+        # Using a global mapwidth/mapheight (first texture's size) for all polygons
+        # is wrong when textures have different sizes (e.g. 256×256 skin + 4×4 patch).
+        if texture_idx in self.textures:
+            tex_w = max(1, self.textures[texture_idx].get('width', mapwidth))
+            tex_h = max(1, self.textures[texture_idx].get('height', mapheight))
+        else:
+            tex_w, tex_h = mapwidth, mapheight
+
         # Texture coordinates (UV)
         uvs = poly_data.get('uvs', [])
         if len(uvs) < vertex_count:
@@ -1476,16 +1488,13 @@ class Wad2Loader:
         tbox = []
         for i in range(vertex_count):
             u, v = uvs[i]
-            if mapwidth > 0 and mapheight > 0:
-                u = max(0.0, min(1.0, u / mapwidth))
-                v = max(0.0, min(1.0, v / mapheight))
+            if tex_w > 0 and tex_h > 0:
+                u = max(0.0, min(1.0, u / tex_w))
+                v = max(0.0, min(1.0, v / tex_h))
                 v = 1.0 - v
             else:
                 u, v = 0.0, 0.0
             tbox.append((u, v))
-
-        # Texture page and coordinates
-        texture_idx = poly_data.get('texture', 0)
 
         # WAD2 textures are standalone; map texture index to page.
         texture_count = len(self.textures)
@@ -1504,8 +1513,8 @@ class Wad2Loader:
             shine=poly_data.get('shine', 0),
             opacity=poly_data.get('opacity', 0),
             page=page,
-            tex_width=mapwidth,
-            tex_height=mapheight,
+            tex_width=tex_w,
+            tex_height=tex_h,
             flipX=poly_data.get('flipped', False),
             flipY=False,
             origin=0,

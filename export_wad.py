@@ -64,8 +64,19 @@ def _image_to_bgra_bytes(image):
     if w == 0 or h == 0:
         return b''
 
+    # Force-load pixel data from disk if not already in memory.
+    # Small images that were never displayed in Blender's viewport may have
+    # has_data=False; accessing pixels without loading returns all-zero bytes.
+    if not image.has_data and image.source == 'FILE':
+        try:
+            image.reload()
+        except Exception:
+            pass
+
     # Blender stores pixels as flat RGBA floats, bottom-up row order
     pixels = image.pixels[:]
+    if len(pixels) < w * h * 4:
+        return bytes(w * h * 4)  # black placeholder if still not loaded
     out = bytearray(w * h * 4)
 
     for y in range(h):
