@@ -42,6 +42,22 @@ def write_leb128_signed(stream, value: int):
         stream.write(struct.pack('B', byte))
 
 
+def write_leb128_unsigned_padded(stream, value: int, num_bytes: int = 4):
+    """
+    Write unsigned LEB128 padded to exactly *num_bytes*.
+
+    The C# ChunkWriter pre-allocates a fixed-width field for chunk sizes
+    (4 bytes by default, 5 for the Textures chunk) then patches it after
+    writing the body.  WadTool / Tomb Editor expect this fixed width.
+    """
+    for i in range(num_bytes):
+        byte = value & 0x7F
+        value >>= 7
+        if i < num_bytes - 1:
+            byte |= 0x80          # continuation bit on all but last byte
+        stream.write(struct.pack('B', byte))
+
+
 # ---------------------------------------------------------------------------
 # Chunk ID strings (from Wad2Chunks.cs)
 # ---------------------------------------------------------------------------
@@ -146,27 +162,43 @@ class ChunkWriter:
     Writes WAD2 chunk-based binary format.
 
     Each chunk is:
-        [LEB128 chunk-id-length] [chunk-id bytes] [LEB128 data-length] [data bytes]
+        [LEB128 chunk-id-length] [chunk-id bytes] [padded-LEB128 data-length] [data bytes]
+
+    The C# ChunkWriter uses **fixed-width** LEB128 for chunk data sizes
+    (4 bytes by default, 5 bytes for very large chunks like Textures).
+    Chunk ID string lengths use standard minimal LEB128.
 
     Child-bearing chunks end their data with a 0x00 byte (zero-length chunk ID
     acting as end-of-children sentinel).
     """
 
-    def __init__(self, stream):
+    # Default size-field width in bytes (matches C# ChunkWriter default)
+    DEFAULT_SIZE_BYTES = 4
+
+    def __init__(self, stream, size_bytes: int = 4):
         self.stream = stream
+        self.size_bytes = size_bytes
 
     # -- Low-level writing helpers --
 
     def _write_chunk_id(self, chunk_id: bytes):
-        """Write a chunk identifier (LEB128-length-prefixed bytes)."""
+        """Write a chunk identifier (minimal LEB128-length-prefixed bytes)."""
         write_leb128_unsigned(self.stream, len(chunk_id))
         self.stream.write(chunk_id)
+
+    def _write_size(self, size: int, num_bytes: int = None):
+        """Write chunk data size as padded LEB128."""
+        if num_bytes is None:
+            num_bytes = self.size_bytes
+        write_leb128_unsigned_padded(self.stream, size, num_bytes)
 
     def _write_chunk_end_marker(self):
         """Write child-chunk-list end sentinel (a single 0x00 byte)."""
         self.stream.write(b'\x00')
 
     # -- Leaf chunk helpers (no children) --
+    # Leaf chunks use MINIMAL LEB128 for their size field,
+    # matching the C# WriteChunkInt / WriteChunkString / etc. behaviour.
 
     def write_chunk_int(self, chunk_id: bytes, value: int):
         """Write a chunk containing a single LEB128 signed integer."""
@@ -174,7 +206,7 @@ class ChunkWriter:
         write_leb128_signed(buf, value)
         data = buf.getvalue()
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        write_leb128_unsigned(self.stream, len(data))   # minimal
         self.stream.write(data)
 
     def write_chunk_string(self, chunk_id: bytes, text: str):
@@ -185,58 +217,64 @@ class ChunkWriter:
         buf.write(encoded)
         data = buf.getvalue()
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        write_leb128_unsigned(self.stream, len(data))   # minimal
         self.stream.write(data)
 
     def write_chunk_float(self, chunk_id: bytes, value: float):
         """Write a chunk containing a single 32-bit float."""
         data = struct.pack('<f', value)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        write_leb128_unsigned(self.stream, len(data))   # minimal
         self.stream.write(data)
 
     def write_chunk_vector3(self, chunk_id: bytes, x: float, y: float, z: float):
         """Write a chunk containing three 32-bit floats."""
         data = struct.pack('<fff', x, y, z)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        write_leb128_unsigned(self.stream, len(data))   # minimal
         self.stream.write(data)
 
     def write_chunk_vector4(self, chunk_id: bytes, x: float, y: float, z: float, w: float):
         """Write a chunk containing four 32-bit floats."""
         data = struct.pack('<ffff', x, y, z, w)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        write_leb128_unsigned(self.stream, len(data))   # minimal
         self.stream.write(data)
 
     def write_chunk_bool(self, chunk_id: bytes, value: bool):
         """Write a chunk containing a single boolean byte."""
         data = struct.pack('?', value)
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        write_leb128_unsigned(self.stream, len(data))   # minimal
         self.stream.write(data)
 
     def write_chunk_bytes(self, chunk_id: bytes, data: bytes):
         """Write a chunk containing raw byte data."""
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        write_leb128_unsigned(self.stream, len(data))   # minimal
         self.stream.write(data)
 
     # -- Parent chunk helpers (with children) --
 
-    def write_chunk_with_children(self, chunk_id: bytes, write_fn):
+    def write_chunk_with_children(self, chunk_id: bytes, write_fn,
+                                  size_bytes: int = None):
         """
         Write a chunk whose body is produced by *write_fn* writing children
         into a temporary buffer.  The end-of-children sentinel is appended
         automatically.
+
+        *size_bytes* overrides the width of this chunk's size field
+        (use 5 for Textures which can be very large).
         """
+        if size_bytes is None:
+            size_bytes = self.size_bytes
         buf = io.BytesIO()
-        child_writer = ChunkWriter(buf)
+        child_writer = ChunkWriter(buf, size_bytes=self.size_bytes)
         write_fn(child_writer)
         child_writer._write_chunk_end_marker()
         data = buf.getvalue()
         self._write_chunk_id(chunk_id)
-        write_leb128_unsigned(self.stream, len(data))
+        self._write_size(len(data), size_bytes)
         self.stream.write(data)
 
     # -- Raw data helpers (write into current chunk body) --
@@ -306,7 +344,7 @@ def _write_wad2_to_stream(stream, wad2_data: dict):
     cw.write_chunk_int(Wad2Chunks.SoundSystem, 1)  # XML
 
     textures = wad2_data.get('textures', [])
-    _write_textures(cw, textures)
+    _write_textures(cw, textures)  # uses size_bytes=5 internally
 
     # Sprites (empty)
     cw.write_chunk_with_children(Wad2Chunks.Sprites, lambda w: None)
@@ -320,8 +358,9 @@ def _write_wad2_to_stream(stream, wad2_data: dict):
     _write_metadata(cw, wad2_data.get('timestamp', None),
                     wad2_data.get('user_notes', ''))
 
-    # Animated texture sets (empty)
-    cw.write_chunk_with_children(Wad2Chunks.AnimatedTextureSets, lambda w: None)
+    # Animated texture sets (empty) — uses 10-byte size (C# long.MaxValue)
+    cw.write_chunk_with_children(Wad2Chunks.AnimatedTextureSets, lambda w: None,
+                                 size_bytes=10)
 
     # Root end marker
     cw._write_chunk_end_marker()
@@ -341,7 +380,9 @@ def _write_textures(cw: ChunkWriter, textures: list):
                 tw.write_chunk_string(Wad2Chunks.TextureRelativePath, t.get('rel_path', ''))
                 tw.write_chunk_bytes(Wad2Chunks.TextureData, t['data'])
             w.write_chunk_with_children(Wad2Chunks.Texture, _tex_inner)
-    cw.write_chunk_with_children(Wad2Chunks.Textures, _inner)
+    # Textures chunk can be very large — use 5-byte LEB128 size
+    # (matches C# LEB128.MaximumSize5Byte)
+    cw.write_chunk_with_children(Wad2Chunks.Textures, _inner, size_bytes=5)
 
 
 # ---------------------------------------------------------------------------
