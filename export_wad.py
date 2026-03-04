@@ -1,3 +1,13 @@
+"""
+WAD / WAD2 Exporter for Blender.
+
+Classic WAD:  Patch-based — reads original WAD, replaces meshtree offsets
+              from modified Blender armatures, writes patched binary.
+WAD2:         Full export — extracts meshes, textures, bones, animations
+              from Blender scene and writes a new .wad2 using the chunk-
+              based format matching Tomb Editor's Wad2Writer.cs exactly.
+"""
+
 import os
 import struct
 import io
@@ -8,55 +18,769 @@ from bpy.props import StringProperty, BoolProperty, EnumProperty, FloatProperty
 from bpy_extras.io_utils import ExportHelper
 
 
+# ============================================================================
+# Shared helpers
+# ============================================================================
+
 def read_uint32(f):
-    """Read unsigned 32-bit integer"""
     return struct.unpack('I', f.read(4))[0]
 
 
 def read_int32(f):
-    """Read signed 32-bit integer"""
     return struct.unpack('i', f.read(4))[0]
 
 
 def write_uint32(f, value):
-    """Write unsigned 32-bit integer"""
     f.write(struct.pack('I', value))
 
 
 def write_int32(f, value):
-    """Write signed 32-bit integer"""
     f.write(struct.pack('i', value))
 
 
-def calculate_meshtree_offsets(collection, scale):
-    """
-    Calculate meshtree offsets from Blender object positions.
-    Returns: (meshes, joints) where joints is [[op, dx, dy, dz], ...]
-    """
-    mesh_objects = [obj for obj in collection.objects if obj.type == 'MESH']
-    mesh_objects.sort(key=lambda x: x.name)
+# ============================================================================
+# WAD2 Export — Blender scene → WAD2 file
+# ============================================================================
 
-    if len(mesh_objects) == 0:
+# ---------- Texture extraction ------------------------------------------------
+
+def _get_texture_image(mat):
+    """Return the first TEX_IMAGE node's image from a material, or None."""
+    if not mat or not mat.use_nodes:
+        return None
+    for node in mat.node_tree.nodes:
+        if node.type == 'TEX_IMAGE' and node.image:
+            return node.image
+    return None
+
+
+def _image_to_bgra_bytes(image):
+    """
+    Convert a Blender image to raw BGRA pixel bytes (top-down scanline order),
+    which is the format Tomb Editor's ImageC stores internally and writes to
+    WAD2 TextureData chunks.
+    """
+    w, h = image.size
+    if w == 0 or h == 0:
+        return b''
+
+    # Blender stores pixels as flat RGBA floats, bottom-up row order
+    pixels = image.pixels[:]
+    out = bytearray(w * h * 4)
+
+    for y in range(h):
+        src_y = h - 1 - y        # flip: Blender bottom-up → WAD2 top-down
+        for x in range(w):
+            si = (src_y * w + x) * 4
+            di = (y * w + x) * 4
+            r = int(min(255, max(0, pixels[si + 0] * 255 + 0.5)))
+            g = int(min(255, max(0, pixels[si + 1] * 255 + 0.5)))
+            b = int(min(255, max(0, pixels[si + 2] * 255 + 0.5)))
+            a = int(min(255, max(0, pixels[si + 3] * 255 + 0.5)))
+            out[di + 0] = b          # BGRA order
+            out[di + 1] = g
+            out[di + 2] = r
+            out[di + 3] = a
+
+    return bytes(out)
+
+
+def _build_texture_table(context):
+    """
+    Scan all materials for unique texture images.
+    Returns (textures_list, image_name→table_index map).
+    """
+    textures = []
+    img_to_idx = {}
+
+    for mat in bpy.data.materials:
+        img = _get_texture_image(mat)
+        if img and img.name not in img_to_idx:
+            w, h = img.size
+            if w == 0 or h == 0:
+                continue
+            textures.append({
+                'width':    w,
+                'height':   h,
+                'data':     _image_to_bgra_bytes(img),
+                'name':     '',
+                'rel_path': '',
+                '_img':     img,          # keep reference for UV → pixel conversion
+            })
+            img_to_idx[img.name] = len(textures) - 1
+
+    return textures, img_to_idx
+
+
+def _tex_index_for_material(mat, img_to_idx):
+    """Return the texture-table index for a material, or 0."""
+    img = _get_texture_image(mat)
+    if img and img.name in img_to_idx:
+        return img_to_idx[img.name]
+    return 0
+
+
+def _tex_dims_for_material(mat, textures, img_to_idx):
+    """Return (width, height) of the texture backing a material."""
+    idx = _tex_index_for_material(mat, img_to_idx)
+    if 0 <= idx < len(textures):
+        return textures[idx]['width'], textures[idx]['height']
+    return 256, 256
+
+
+# ---------- Mesh extraction ---------------------------------------------------
+
+def _extract_mesh(mesh_obj, textures, img_to_idx, scale):
+    """
+    Extract a single Blender mesh object into the dict expected by write_wad2.
+    Coordinates are scaled to TR units.  UVs are converted back to pixel
+    coordinates (reversing the 0-1 normalisation and V-flip done on import).
+    """
+    # Evaluate mesh with modifiers applied
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj  = mesh_obj.evaluated_get(depsgraph)
+    eval_mesh = eval_obj.data
+
+    # -- Positions (float, scaled) --
+    positions = []
+    for v in eval_mesh.vertices:
+        positions.append((v.co.x * scale, v.co.y * scale, v.co.z * scale))
+
+    # -- Normals --
+    normals = []
+    for v in eval_mesh.vertices:
+        normals.append((v.normal.x, v.normal.y, v.normal.z))
+
+    # -- Vertex colours (from "shade" colour attribute if present) --
+    colors = []
+    shade_layer = None
+    for attr in eval_mesh.color_attributes:
+        shade_layer = attr          # use the first one
+        break
+    if shade_layer and shade_layer.domain == 'CORNER':
+        accum = {}
+        for poly in eval_mesh.polygons:
+            for li in poly.loop_indices:
+                vi = eval_mesh.loops[li].vertex_index
+                c  = shade_layer.data[li].color
+                if vi not in accum:
+                    accum[vi] = [0.0, 0.0, 0.0, 0]
+                accum[vi][0] += c[0]
+                accum[vi][1] += c[1]
+                accum[vi][2] += c[2]
+                accum[vi][3] += 1
+        for vi in range(len(eval_mesh.vertices)):
+            if vi in accum and accum[vi][3] > 0:
+                n = accum[vi][3]
+                colors.append((accum[vi][0]/n, accum[vi][1]/n, accum[vi][2]/n))
+            else:
+                colors.append((1.0, 1.0, 1.0))
+
+    # -- UV layer --
+    uv_layer = eval_mesh.uv_layers.active
+
+    # -- Polygons --
+    polygons = []
+    for poly in eval_mesh.polygons:
+        verts = list(poly.vertices)
+
+        # Get material → texture index + dimensions
+        mat = (mesh_obj.data.materials[poly.material_index]
+               if poly.material_index < len(mesh_obj.data.materials) else None)
+        tex_idx = _tex_index_for_material(mat, img_to_idx)
+        tw, th  = _tex_dims_for_material(mat, textures, img_to_idx)
+
+        # Detect blend mode from material name
+        blend_mode = 0
+        if mat:
+            mname = mat.name.lower()
+            if 'additive' in mname:
+                blend_mode = 2
+            elif 'alphatest' in mname or 'alpha_test' in mname:
+                blend_mode = 1
+
+        # Read per-polygon custom properties stored on import
+        shine = 0
+        double_sided = False
+
+        # UV → pixel coordinates (reverse import transform)
+        raw_uvs = []
+        if uv_layer:
+            for li in poly.loop_indices:
+                u, v = uv_layer.data[li].uv
+                # Import did: u = u_pixel / tex_w,  v = 1.0 - (v_pixel / tex_h)
+                # Reverse:
+                u_px = u * tw
+                v_px = (1.0 - v) * th
+                raw_uvs.append((u_px, v_px))
+        else:
+            raw_uvs = [(0.0, 0.0)] * len(verts)
+
+        # ParentArea — bounding rectangle of the UVs in pixel space
+        if raw_uvs:
+            min_u = min(uv[0] for uv in raw_uvs)
+            min_v = min(uv[1] for uv in raw_uvs)
+            max_u = max(uv[0] for uv in raw_uvs)
+            max_v = max(uv[1] for uv in raw_uvs)
+            parent_area = (min_u, min_v, max_u, max_v)
+        else:
+            parent_area = (0.0, 0.0, float(tw), float(th))
+
+        # Triangulate n-gons (>4 verts)
+        if len(verts) > 4:
+            for i in range(1, len(verts) - 1):
+                tri_verts = [verts[0], verts[i], verts[i+1]]
+                tri_uvs   = [raw_uvs[0], raw_uvs[i], raw_uvs[i+1]]
+                _add_polygon(polygons, 'tri', tri_verts, tri_uvs,
+                             shine, tex_idx, parent_area, blend_mode, double_sided)
+        elif len(verts) in (3, 4):
+            shape = 'quad' if len(verts) == 4 else 'tri'
+            _add_polygon(polygons, shape, verts, raw_uvs,
+                         shine, tex_idx, parent_area, blend_mode, double_sided)
+
+    # -- Bounds --
+    if positions:
+        xs = [p[0] for p in positions]
+        ys = [p[1] for p in positions]
+        zs = [p[2] for p in positions]
+        bbox_min = (min(xs), min(ys), min(zs))
+        bbox_max = (max(xs), max(ys), max(zs))
+        cx, cy, cz = ((bbox_min[i] + bbox_max[i]) / 2 for i in range(3))
+        radius = max(math.sqrt((p[0]-cx)**2 + (p[1]-cy)**2 + (p[2]-cz)**2)
+                     for p in positions)
+    else:
+        bbox_min = bbox_max = (0, 0, 0)
+        cx = cy = cz = radius = 0.0
+
+    return {
+        'name':           mesh_obj.name,
+        'positions':      positions,
+        'normals':        normals,
+        'colors':         colors,
+        'sphere_center':  (cx, cy, cz),
+        'sphere_radius':  radius,
+        'bbox_min':       bbox_min,
+        'bbox_max':       bbox_max,
+        'polygons':       polygons,
+        'lighting_type':  0,
+        'hidden':         False,
+    }
+
+
+def _add_polygon(out, shape, indices, uvs, shine, tex_idx,
+                 parent_area, blend_mode, double_sided):
+    out.append({
+        'shape':         shape,
+        'indices':       indices,
+        'shine':         shine,
+        'texture_index': tex_idx,
+        'parent_area':   parent_area,
+        'uvs':           uvs,
+        'blend_mode':    blend_mode,
+        'double_sided':  double_sided,
+    })
+
+
+# ---------- Bone extraction ---------------------------------------------------
+
+def _extract_bones(rig, mesh_objects, scale):
+    """
+    Build the WAD2 Bone2 list from an armature.
+
+    Returns list of dicts: {op, name, translation, mesh_index}.
+    OpCodes:  0 = Push, 1 = Pop, 2 = Read/Peek, 3 = NotUseStack (simple chain)
+    C# enum WadLinkOpcode: Push=0, Pop=1, Read=2, NotUseStack=3
+    """
+    bones = []
+
+    if not rig or rig.type != 'ARMATURE':
+        # No armature → simple linear chain (all NotUseStack)
+        for i, obj in enumerate(mesh_objects):
+            if i == 0:
+                bones.append({'op': 0, 'name': obj.name,
+                              'translation': (0.0, 0.0, 0.0), 'mesh_index': 0})
+            else:
+                prev = mesh_objects[i - 1]
+                dx = (obj.location.x - prev.location.x) * scale
+                dy = (obj.location.y - prev.location.y) * scale
+                dz = (obj.location.z - prev.location.z) * scale
+                bones.append({'op': 0, 'name': obj.name,
+                              'translation': (dx, dy, dz), 'mesh_index': i})
+        return bones
+
+    # Build a mapping: mesh_name → armature bone
+    arm_bones = rig.data.bones
+    name_lookup = {b.name: b for b in arm_bones}
+
+    for i, mesh_obj in enumerate(mesh_objects):
+        bone = name_lookup.get(mesh_obj.name)
+
+        if i == 0:
+            # Root — always Push, zero translation
+            bones.append({
+                'op':          0,
+                'name':        mesh_obj.name,
+                'translation': (0.0, 0.0, 0.0),
+                'mesh_index':  0,
+            })
+            continue
+
+        # Translation relative to parent mesh
+        if bone and bone.parent:
+            parent_name = bone.parent.name
+            parent_mesh = next((m for m in mesh_objects if m.name == parent_name), None)
+            if parent_mesh:
+                dx = (mesh_obj.location.x - parent_mesh.location.x) * scale
+                dy = (mesh_obj.location.y - parent_mesh.location.y) * scale
+                dz = (mesh_obj.location.z - parent_mesh.location.z) * scale
+            else:
+                dx = mesh_obj.location.x * scale
+                dy = mesh_obj.location.y * scale
+                dz = mesh_obj.location.z * scale
+
+            # Determine stack opcode from sibling structure
+            siblings = list(bone.parent.children)
+            if len(siblings) <= 1:
+                op = 0    # NotUseStack — single child
+            else:
+                idx_in_siblings = siblings.index(bone)
+                if idx_in_siblings == 0:
+                    op = 2   # Push
+                elif idx_in_siblings == len(siblings) - 1:
+                    op = 1   # Pop
+                else:
+                    op = 3   # Read (peek)
+        else:
+            # Orphan bone or no parent info — chain
+            prev = mesh_objects[i - 1]
+            dx = (mesh_obj.location.x - prev.location.x) * scale
+            dy = (mesh_obj.location.y - prev.location.y) * scale
+            dz = (mesh_obj.location.z - prev.location.z) * scale
+            op = 0
+
+        bones.append({
+            'op':          op,
+            'name':        mesh_obj.name,
+            'translation': (dx, dy, dz),
+            'mesh_index':  i,
+        })
+
+    return bones
+
+
+# ---------- Animation extraction ----------------------------------------------
+
+def _extract_animations(rig, mesh_objects, scale):
+    """
+    Extract all NLA-strip / active-action animations from an armature.
+    Returns list of animation dicts for write_wad2.
+    """
+    if not rig or rig.type != 'ARMATURE' or not rig.animation_data:
+        return []
+
+    # Collect unique actions from NLA tracks and active action
+    actions = []
+    if rig.animation_data.nla_tracks:
+        for track in rig.animation_data.nla_tracks:
+            for strip in track.strips:
+                if strip.action and strip.action not in actions:
+                    actions.append(strip.action)
+    if rig.animation_data.action:
+        if rig.animation_data.action not in actions:
+            actions.append(rig.animation_data.action)
+
+    if not actions:
+        return []
+
+    bone_names = [m.name for m in mesh_objects]
+    old_action = rig.animation_data.action
+    old_frame  = bpy.context.scene.frame_current
+
+    animations = []
+    for action in actions:
+        rig.animation_data.action = action
+
+        frame_start = int(action.frame_range[0])
+        frame_end   = int(action.frame_range[1])
+
+        # Gather unique keyframe positions from fcurves
+        kf_frames = sorted(set(
+            int(kp.co[0])
+            for fc in action.fcurves
+            for kp in fc.keyframe_points
+            if frame_start <= int(kp.co[0]) <= frame_end
+        ))
+        if not kf_frames:
+            kf_frames = [frame_start]
+
+        keyframes = []
+        for frame in kf_frames:
+            bpy.context.scene.frame_set(frame)
+            bpy.context.view_layer.update()
+
+            kf = {
+                'offset':  (0.0, 0.0, 0.0),
+                'bb_min':  (0.0, 0.0, 0.0),
+                'bb_max':  (0.0, 0.0, 0.0),
+                'angles':  [],
+            }
+
+            # Root bone offset
+            if bone_names and bone_names[0] in rig.pose.bones:
+                loc = rig.pose.bones[bone_names[0]].location
+                kf['offset'] = (loc.x * scale, loc.y * scale, loc.z * scale)
+
+            # Euler rotations per bone
+            for bn in bone_names:
+                if bn in rig.pose.bones:
+                    rot = rig.pose.bones[bn].rotation_euler
+                    kf['angles'].append((rot.x, rot.y, rot.z))
+                else:
+                    kf['angles'].append((0.0, 0.0, 0.0))
+
+            keyframes.append(kf)
+
+        # Read optional custom properties from the action
+        state_id   = int(action.get('state_id', 0))
+        next_anim  = int(action.get('next_animation', 0))
+        next_frame = int(action.get('next_frame', 0))
+        frame_rate = int(action.get('frame_rate', 1))
+
+        # State changes from custom prop (JSON list if present)
+        state_changes = []
+        sc_raw = action.get('state_changes')
+        if sc_raw and isinstance(sc_raw, str):
+            import json
+            try:
+                state_changes = json.loads(sc_raw)
+            except Exception:
+                pass
+
+        # Anim commands
+        commands = []
+        cmd_raw = action.get('anim_commands')
+        if cmd_raw and isinstance(cmd_raw, str):
+            import json
+            try:
+                commands = json.loads(cmd_raw)
+            except Exception:
+                pass
+
+        animations.append({
+            'state_id':                state_id,
+            'end_frame':               max(0, frame_end - frame_start),
+            'frame_rate':              frame_rate,
+            'next_animation':          next_anim,
+            'next_frame':              next_frame,
+            'name':                    action.name,
+            'keyframes':               keyframes,
+            'state_changes':           state_changes,
+            'commands':                commands,
+            'start_velocity':          float(action.get('start_velocity', 0)),
+            'end_velocity':            float(action.get('end_velocity', 0)),
+            'start_lateral_velocity':  float(action.get('start_lateral_velocity', 0)),
+            'end_lateral_velocity':    float(action.get('end_lateral_velocity', 0)),
+        })
+
+    # Restore state
+    rig.animation_data.action = old_action
+    bpy.context.scene.frame_set(old_frame)
+
+    return animations
+
+
+# ---------- Slot-ID resolution ------------------------------------------------
+
+def _resolve_slot_id(collection_or_object, name_to_id):
+    """
+    Determine the numeric slot ID for a collection or object.
+    Priority:
+      1. Custom property 'wad_slot_id'
+      2. name_to_id reverse lookup
+      3. Trailing digits in the name (e.g. 'BADDY_1' → 1)
+      4. Fallback to 0
+    """
+    name = collection_or_object.name
+
+    # 1. Explicit custom property
+    sid = collection_or_object.get('wad_slot_id')
+    if sid is not None:
+        return int(sid)
+
+    # 2. Name mapping
+    if name in name_to_id:
+        return int(name_to_id[name])
+
+    # 3. Trailing digits
+    m = re.search(r'(\d+)$', name)
+    if m:
+        return int(m.group(1))
+
+    return 0
+
+
+# ---------- Main WAD2 export entry point --------------------------------------
+
+def export_wad2(context, filepath, scale, game, export_anims=True):
+    """Export the Blender scene as a WAD2 file."""
+    from .wad.write_wad2 import write_wad2_file
+    from datetime import datetime
+
+    print("=" * 60)
+    print("WAD2 Export")
+    print("=" * 60)
+
+    # Build reverse name→ID map from the objects module (if available)
+    name_to_id = {}
+    try:
+        from . import objects
+        mov_names, static_names, _, _ = objects.get_names(game)
+        name_to_id = {v: k for k, v in mov_names.items()}
+        static_name_to_id = {v: k for k, v in static_names.items()}
+        name_to_id.update(static_name_to_id)
+    except Exception as e:
+        print(f"[WAD2 Export] Could not load name mapping: {e}")
+
+    # Build texture table
+    textures, img_to_idx = _build_texture_table(context)
+    print(f"Textures: {len(textures)}")
+
+    # ---- Moveables ----
+    moveables = []
+    movables_col = bpy.data.collections.get('Movables')
+    if movables_col:
+        for col in movables_col.children:
+            mesh_objects = sorted(
+                [o for o in col.objects if o.type == 'MESH'],
+                key=lambda o: o.name
+            )
+            if not mesh_objects:
+                print(f"  {col.name}: skipped (no meshes)")
+                continue
+
+            rig = next((o for o in col.objects if o.type == 'ARMATURE'), None)
+            mov_id = _resolve_slot_id(col, name_to_id)
+
+            meshes = []
+            for mobj in mesh_objects:
+                md = _extract_mesh(mobj, textures, img_to_idx, scale)
+                meshes.append(md)
+
+            bones = _extract_bones(rig, mesh_objects, scale)
+
+            animations = []
+            if export_anims:
+                animations = _extract_animations(rig, mesh_objects, scale)
+
+            moveables.append({
+                'id':         mov_id,
+                'meshes':     meshes,
+                'bones':      bones,
+                'animations': animations,
+            })
+
+            total_polys = sum(len(m['polygons']) for m in meshes)
+            print(f"  {col.name} (ID {mov_id}): {len(meshes)} meshes, "
+                  f"{len(bones)} bones, {len(animations)} anims, "
+                  f"{total_polys} polys")
+
+    # ---- Statics ----
+    statics_list = []
+    statics_col = bpy.data.collections.get('Statics')
+    if statics_col:
+        # Statics may be direct objects or sub-collections
+        static_objs = [o for o in statics_col.objects if o.type == 'MESH']
+        # Also check child collections
+        for child_col in statics_col.children:
+            static_objs.extend(o for o in child_col.objects if o.type == 'MESH')
+
+        for obj in static_objs:
+            static_id = _resolve_slot_id(obj, name_to_id)
+            md = _extract_mesh(obj, textures, img_to_idx, scale)
+
+            statics_list.append({
+                'id':             static_id,
+                'flags':          0,
+                'mesh':           md,
+                'ambient_light':  0,
+                'shatter':        False,
+                'shatter_sound':  0,
+                'vis_box_min':    md['bbox_min'],
+                'vis_box_max':    md['bbox_max'],
+                'col_box_min':    md['bbox_min'],
+                'col_box_max':    md['bbox_max'],
+            })
+            print(f"  Static {obj.name} (ID {static_id}): "
+                  f"{len(md['positions'])} verts, {len(md['polygons'])} polys")
+
+    # ---- Assemble & write ----
+    now = datetime.now()
+    wad2_data = {
+        'game_version': _game_to_version(game),
+        'textures':     textures,
+        'moveables':    moveables,
+        'statics':      statics_list,
+        'timestamp':    (now.year, now.month, now.day,
+                         now.hour, now.minute, now.second),
+        'user_notes':   'Exported from Blender via WADBlender',
+    }
+
+    # Strip internal-only keys from textures before writing
+    for t in wad2_data['textures']:
+        t.pop('_img', None)
+
+    write_wad2_file(filepath, wad2_data)
+
+    print("=" * 60)
+    print(f"WAD2 exported: {filepath}")
+    print(f"  {len(textures)} textures, {len(moveables)} moveables, "
+          f"{len(statics_list)} statics")
+    print("=" * 60)
+
+    return {'FINISHED'}
+
+
+def _game_to_version(game_str):
+    return {'TR1': 1, 'TR2': 2, 'TR3': 3, 'TR4': 4,
+            'TR5': 5, 'TR5Main': 5, 'TEN': 4}.get(game_str, 4)
+
+
+# ============================================================================
+# Classic WAD Export (patch-based)
+# ============================================================================
+
+def export_wad(context, filepath, import_path, scale, game):
+    """Export by patching meshtree offsets in the original classic WAD."""
+    from . import objects
+    mov_names, _, _, _ = objects.get_names(game)
+    name_to_id = {name: idx for idx, name in mov_names.items()}
+    print(f"Loaded {len(name_to_id)} movable name mappings for {game}")
+
+    with open(import_path, 'rb') as f:
+        original_data = f.read()
+
+    f = io.BytesIO(original_data)
+
+    version = read_uint32(f)
+    assert 129 <= version <= 130, f"Unsupported WAD version: {version}"
+
+    texture_samples_count = read_uint32(f)
+    f.seek(f.tell() + texture_samples_count * 8)
+    bytes_size = read_uint32(f)
+    f.seek(f.tell() + bytes_size)
+    mesh_pointers_count = read_uint32(f)
+    f.seek(f.tell() + mesh_pointers_count * 4)
+    words_size = read_uint32(f)
+    f.seek(f.tell() + words_size * 2)
+    animations_count = read_uint32(f)
+    f.seek(f.tell() + animations_count * 40)
+    state_changes_count = read_uint32(f)
+    f.seek(f.tell() + state_changes_count * 6)
+    dispatches_count = read_uint32(f)
+    f.seek(f.tell() + dispatches_count * 8)
+    commands_words = read_uint32(f)
+    f.seek(f.tell() + commands_words * 2)
+
+    links_offset = f.tell()
+    dwords_size = read_uint32(f)
+    original_links = [read_int32(f) for _ in range(dwords_size)]
+    links_end = f.tell()
+
+    keyframes_words = read_uint32(f)
+    f.seek(f.tell() + keyframes_words * 2)
+
+    movables_count = read_uint32(f)
+    movables_data = []
+    for _ in range(movables_count):
+        movables_data.append({
+            'obj_ID':           read_uint32(f),
+            'num_pointers':     struct.unpack('H', f.read(2))[0],
+            'pointers_index':   struct.unpack('H', f.read(2))[0],
+            'links_index':      read_uint32(f),
+            'keyframes_offset': read_uint32(f),
+            'anims_index':      struct.unpack('h', f.read(2))[0],
+        })
+
+    modified_joints = {}
+    movables_col = bpy.data.collections.get('Movables')
+    if movables_col:
+        for collection in movables_col.children:
+            mesh_objects, new_joints = calculate_meshtree_offsets(collection, scale)
+            if not new_joints:
+                continue
+
+            col_name = collection.name
+            movable_id = name_to_id.get(col_name)
+            if movable_id is not None:
+                movable_id = int(movable_id)
+
+            for md in movables_data:
+                matches = (
+                    md['obj_ID'] == movable_id or
+                    col_name.endswith(str(md['obj_ID'])) or
+                    col_name == f"MOVABLE{md['obj_ID']}" or
+                    col_name.startswith(f"MOVABLE{md['obj_ID']}_")
+                )
+                if not matches:
+                    continue
+
+                num_joints = md['num_pointers'] - 1
+                if len(new_joints) != num_joints:
+                    print(f"  WARNING: {col_name} joint count mismatch "
+                          f"({len(new_joints)} vs {num_joints})")
+                    break
+
+                li = md['links_index']
+                patched = []
+                for i, nj in enumerate(new_joints):
+                    base = li + i * 4
+                    orig_op = (original_links[base] if base < len(original_links) else nj[0])
+                    patched.append([orig_op, nj[1], nj[2], nj[3]])
+                modified_joints[li] = patched
+                break
+
+    new_links = original_links.copy()
+    for li, joints in modified_joints.items():
+        for i, j in enumerate(joints):
+            base = li + i * 4
+            if base + 3 < len(new_links):
+                new_links[base:base+4] = j
+
+    with open(filepath, 'wb') as out:
+        out.write(original_data[:links_offset])
+        write_uint32(out, len(new_links))
+        for v in new_links:
+            write_int32(out, v)
+        out.write(original_data[links_end:])
+
+    print(f"Classic WAD exported: {filepath} ({len(modified_joints)} movables patched)")
+    return {'FINISHED'}
+
+
+def calculate_meshtree_offsets(collection, scale):
+    """Calculate meshtree offsets from Blender armature/mesh positions."""
+    mesh_objects = sorted(
+        [o for o in collection.objects if o.type == 'MESH'],
+        key=lambda o: o.name
+    )
+    if not mesh_objects:
         return [], []
 
-    joints = []
-    rig = next((obj for obj in collection.objects if obj.type == 'ARMATURE'), None)
+    rig = next((o for o in collection.objects if o.type == 'ARMATURE'), None)
     parent_map = {}
 
     if rig and len(mesh_objects) > 1:
-        bone_names = [bone.name for bone in rig.data.bones]
-
-        for i, mesh_obj in enumerate(mesh_objects):
+        bone_names = [b.name for b in rig.data.bones]
+        for i, mobj in enumerate(mesh_objects):
             if i == 0:
                 continue
-
-            bone_name = mesh_obj.name
-            if bone_name in bone_names:
-                bone = rig.data.bones[bone_name]
+            bn = mobj.name
+            if bn in bone_names:
+                bone = rig.data.bones[bn]
                 if bone.parent:
-                    parent_name = bone.parent.name
-                    parent_idx = next((j for j, m in enumerate(mesh_objects) if m.name == parent_name), 0)
-                    parent_map[i] = parent_idx
+                    pn = bone.parent.name
+                    pi = next((j for j, m in enumerate(mesh_objects) if m.name == pn), 0)
+                    parent_map[i] = pi
                 else:
                     parent_map[i] = 0
             else:
@@ -65,712 +789,44 @@ def calculate_meshtree_offsets(collection, scale):
         for i in range(1, len(mesh_objects)):
             parent_map[i] = i - 1
 
+    joints = []
+    bone_names = [b.name for b in rig.data.bones] if rig else []
     for i in range(1, len(mesh_objects)):
-        mesh_obj = mesh_objects[i]
-        parent_idx = parent_map.get(i, i - 1)
-        parent_obj = mesh_objects[parent_idx]
+        mobj = mesh_objects[i]
+        pi = parent_map.get(i, i - 1)
+        pobj = mesh_objects[pi]
 
-        bone_name = mesh_obj.name
-
-        # Use mesh local positions (same as Reference code)
-        loc = mesh_obj.location
-        parent_loc = parent_obj.location
-
-        dx = int((loc.x - parent_loc.x) * scale)
-        dy = int((loc.y - parent_loc.y) * scale)
-        dz = int((loc.z - parent_loc.z) * scale)
+        dx = int((mobj.location.x - pobj.location.x) * scale)
+        dy = int((mobj.location.y - pobj.location.y) * scale)
+        dz = int((mobj.location.z - pobj.location.z) * scale)
 
         op = 0
-
-        if rig and bone_name in bone_names:
-            bone = rig.data.bones[bone_name]
+        if rig and mobj.name in bone_names:
+            bone = rig.data.bones[mobj.name]
             if bone.parent:
-                parent_name = bone.parent.name
-                if i > 0 and mesh_objects[i-1].name == parent_name:
+                if i > 0 and mesh_objects[i-1].name == bone.parent.name:
                     op = 0
                 else:
                     op = 3
-
         joints.append([op, dx, dy, dz])
 
     return mesh_objects, joints
 
 
 # ============================================================================
-# WAD2 Export Functions
+# Blender Operator
 # ============================================================================
 
-def extract_mesh_data_from_blender(mesh_obj, scale):
-    """Extract mesh data from a Blender mesh object for WAD2 export"""
-    mesh = mesh_obj.data
-    mesh.calc_loop_triangles()
-
-    positions = []
-    for vert in mesh.vertices:
-        positions.append((vert.co.x, vert.co.y, vert.co.z))
-
-    normals = []
-    for vert in mesh.vertices:
-        normals.append((vert.normal.x, vert.normal.y, vert.normal.z))
-
-    uv_layer = mesh.uv_layers.active
-    has_uvs = uv_layer is not None
-
-    triangles = []
-    quads = []
-
-    for poly in mesh.polygons:
-        indices = list(poly.vertices)
-
-        uvs = []
-        if has_uvs:
-            for loop_idx in poly.loop_indices:
-                uv = uv_layer.data[loop_idx].uv
-                uvs.append((uv.x, uv.y))
-        else:
-            uvs = [(0.0, 0.0)] * len(indices)
-
-        mat_idx = poly.material_index
-
-        poly_data = {
-            'indices': indices,
-            'uvs': uvs,
-            'texture': mat_idx,
-            'shine': 0,
-            'blend_mode': 0,
-            'double_sided': False
-        }
-
-        if len(indices) == 3:
-            triangles.append(poly_data)
-        elif len(indices) == 4:
-            quads.append(poly_data)
-        else:
-            for i in range(1, len(indices) - 1):
-                tri_indices = [indices[0], indices[i], indices[i + 1]]
-                tri_uvs = [uvs[0], uvs[i], uvs[i + 1]] if uvs else [(0, 0)] * 3
-                triangles.append({
-                    'indices': tri_indices,
-                    'uvs': tri_uvs,
-                    'texture': mat_idx,
-                    'shine': 0,
-                    'blend_mode': 0,
-                    'double_sided': False
-                })
-
-    if positions:
-        min_x = min(p[0] for p in positions)
-        max_x = max(p[0] for p in positions)
-        min_y = min(p[1] for p in positions)
-        max_y = max(p[1] for p in positions)
-        min_z = min(p[2] for p in positions)
-        max_z = max(p[2] for p in positions)
-
-        center = ((min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2)
-        radius = max(
-            math.sqrt((p[0] - center[0])**2 + (p[1] - center[1])**2 + (p[2] - center[2])**2)
-            for p in positions
-        )
-
-        sphere = {'center': center, 'radius': radius}
-        bbox = {'min': (min_x, min_y, min_z), 'max': (max_x, max_y, max_z)}
-    else:
-        sphere = {'center': (0, 0, 0), 'radius': 0}
-        bbox = {'min': (0, 0, 0), 'max': (0, 0, 0)}
-
-    return {
-        'name': mesh_obj.name,
-        'positions': positions,
-        'normals': normals,
-        'shades': [],
-        'triangles': triangles,
-        'quads': quads,
-        'sphere': sphere,
-        'bbox': bbox
-    }
-
-
-def extract_bone_data_from_armature(rig, mesh_objects, scale):
-    """Extract bone hierarchy data from armature for WAD2 export"""
-    bones = []
-
-    if not rig or rig.type != 'ARMATURE':
-        for i, mesh_obj in enumerate(mesh_objects):
-            bone = {
-                'name': mesh_obj.name,
-                'op': 0 if i > 0 else 0,
-                'mesh': i,
-                'translation': (0, 0, 0) if i == 0 else (
-                    mesh_obj.location.x - mesh_objects[i-1].location.x,
-                    mesh_obj.location.y - mesh_objects[i-1].location.y,
-                    mesh_obj.location.z - mesh_objects[i-1].location.z
-                )
-            }
-            bones.append(bone)
-        return bones
-
-    mesh_to_bone = {}
-    for bone in rig.data.bones:
-        bone_base = bone.name.replace('_BONE', '').replace('.BONE', '')
-        for i, mesh_obj in enumerate(mesh_objects):
-            mesh_base = mesh_obj.name.split('_')[-1] if '_' in mesh_obj.name else mesh_obj.name
-            if bone_base == mesh_base or bone_base in mesh_obj.name or mesh_obj.name in bone_base:
-                mesh_to_bone[i] = bone
-                break
-
-    stack = []
-
-    for i, mesh_obj in enumerate(mesh_objects):
-        bone = mesh_to_bone.get(i)
-
-        if bone:
-            if i == 0:
-                op = 0
-                translation = (0, 0, 0)
-            else:
-                parent_bone = bone.parent
-                if parent_bone:
-                    parent_mesh_idx = -1
-                    for j, other_bone in mesh_to_bone.items():
-                        if other_bone == parent_bone:
-                            parent_mesh_idx = j
-                            break
-
-                    if parent_mesh_idx == i - 1:
-                        op = 0
-                    elif parent_mesh_idx >= 0:
-                        op = 3
-                        if parent_mesh_idx not in stack:
-                            stack.append(parent_mesh_idx)
-                    else:
-                        op = 0
-                else:
-                    op = 0
-
-                if parent_bone:
-                    parent_head = rig.matrix_world @ parent_bone.head_local
-                    bone_head = rig.matrix_world @ bone.head_local
-                    translation = (
-                        bone_head.x - parent_head.x,
-                        bone_head.y - parent_head.y,
-                        bone_head.z - parent_head.z
-                    )
-                else:
-                    translation = (bone.head_local.x, bone.head_local.y, bone.head_local.z)
-
-            bones.append({
-                'name': bone.name,
-                'op': op,
-                'mesh': i,
-                'translation': translation
-            })
-        else:
-            bones.append({
-                'name': mesh_obj.name,
-                'op': 0,
-                'mesh': i,
-                'translation': (0, 0, 0) if i == 0 else (
-                    mesh_obj.location.x - mesh_objects[i-1].location.x,
-                    mesh_obj.location.y - mesh_objects[i-1].location.y,
-                    mesh_obj.location.z - mesh_objects[i-1].location.z
-                )
-            })
-
-    return bones
-
-
-def extract_animation_data_from_rig(rig, num_bones, scale):
-    """Extract animation data from armature for WAD2 export"""
-    animations = []
-
-    if not rig or rig.type != 'ARMATURE':
-        return animations
-
-    actions = []
-    if rig.animation_data:
-        if rig.animation_data.action:
-            actions.append(rig.animation_data.action)
-        if rig.animation_data.nla_tracks:
-            for track in rig.animation_data.nla_tracks:
-                for strip in track.strips:
-                    if strip.action and strip.action not in actions:
-                        actions.append(strip.action)
-
-    for action in bpy.data.actions:
-        if action not in actions:
-            if rig.name in action.name or action.name.startswith(rig.name.split('_')[0]):
-                actions.append(action)
-
-    for action in actions:
-        anim_data = extract_single_animation(rig, action, num_bones, scale)
-        if anim_data:
-            animations.append(anim_data)
-
-    return animations
-
-
-def extract_single_animation(rig, action, num_bones, scale):
-    """Extract a single animation from an action"""
-    if not action:
-        return None
-
-    frame_start = int(action.frame_range[0])
-    frame_end = int(action.frame_range[1])
-
-    if frame_end <= frame_start:
-        return None
-
-    original_action = rig.animation_data.action if rig.animation_data else None
-    original_frame = bpy.context.scene.frame_current
-
-    if not rig.animation_data:
-        rig.animation_data_create()
-    rig.animation_data.action = action
-
-    bone_names = [bone.name for bone in rig.data.bones]
-
-    keyframes = []
-    frame_step = 1
-
-    for frame in range(frame_start, frame_end + 1, frame_step):
-        bpy.context.scene.frame_set(frame)
-        bpy.context.view_layer.update()
-
-        kf_data = {
-            'offset': (0, 0, 0),
-            'rotations': [],
-            'bbox': {'min': (-100, -100, -100), 'max': (100, 100, 100)}
-        }
-
-        if rig.pose.bones:
-            root_bone = rig.pose.bones[0]
-            loc = root_bone.matrix.translation
-            kf_data['offset'] = (loc.x, loc.y, loc.z)
-
-        for bone_name in bone_names:
-            pose_bone = rig.pose.bones.get(bone_name)
-            if pose_bone:
-                quat = pose_bone.matrix.to_quaternion()
-                kf_data['rotations'].append((quat.w, quat.x, quat.y, quat.z))
-            else:
-                kf_data['rotations'].append((1.0, 0.0, 0.0, 0.0))
-
-        keyframes.append(kf_data)
-
-    if original_action:
-        rig.animation_data.action = original_action
-    bpy.context.scene.frame_set(original_frame)
-
-    return {
-        'name': action.name,
-        'state_id': 0,
-        'end_frame': len(keyframes) - 1,
-        'frame_rate': 1,
-        'next_animation': 0,
-        'next_frame': 0,
-        'velocity': (0.0, 0.0, 0.0, 0.0),
-        'keyframes': keyframes,
-        'state_changes': {},
-        'commands': []
-    }
-
-
-def extract_texture_data_from_materials(mesh_objects):
-    """Extract texture data from materials for WAD2 export"""
-    textures = []
-    texture_map = {}
-
-    for mesh_obj in mesh_objects:
-        if not mesh_obj.data.materials:
-            continue
-
-        for mat in mesh_obj.data.materials:
-            if not mat or mat.name in texture_map:
-                continue
-
-            texture_data = None
-            if mat.use_nodes:
-                for node in mat.node_tree.nodes:
-                    if node.type == 'TEX_IMAGE' and node.image:
-                        img = node.image
-                        width, height = img.size
-                        if width > 0 and height > 0:
-                            pixels = list(img.pixels)
-
-                            bgra_data = bytearray(width * height * 4)
-                            for y in range(height):
-                                for x in range(width):
-                                    src_idx = ((height - 1 - y) * width + x) * 4
-                                    dst_idx = (y * width + x) * 4
-                                    r = int(pixels[src_idx] * 255)
-                                    g = int(pixels[src_idx + 1] * 255)
-                                    b = int(pixels[src_idx + 2] * 255)
-                                    a = int(pixels[src_idx + 3] * 255)
-                                    bgra_data[dst_idx] = b
-                                    bgra_data[dst_idx + 1] = g
-                                    bgra_data[dst_idx + 2] = r
-                                    bgra_data[dst_idx + 3] = a
-
-                            texture_data = {
-                                'index': len(textures),
-                                'name': mat.name,
-                                'width': width,
-                                'height': height,
-                                'data': bytes(bgra_data)
-                            }
-                            break
-
-            if texture_data:
-                texture_map[mat.name] = len(textures)
-                textures.append(texture_data)
-            else:
-                texture_map[mat.name] = len(textures)
-                textures.append({
-                    'index': len(textures),
-                    'name': mat.name,
-                    'width': 256,
-                    'height': 256,
-                    'data': bytes([128, 128, 128, 255] * 256 * 256)
-                })
-
-    return textures, texture_map
-
-
-def collect_moveable_data(collection, scale):
-    """Collect all moveable data from a collection for WAD2 export"""
-    mesh_objects = [obj for obj in collection.objects if obj.type == 'MESH']
-    mesh_objects.sort(key=lambda x: x.name)
-
-    if not mesh_objects:
-        return None
-
-    rig = next((obj for obj in collection.objects if obj.type == 'ARMATURE'), None)
-
-    meshes = []
-    for mesh_obj in mesh_objects:
-        mesh_data = extract_mesh_data_from_blender(mesh_obj, scale)
-        meshes.append(mesh_data)
-
-    bones = extract_bone_data_from_armature(rig, mesh_objects, scale)
-    animations = extract_animation_data_from_rig(rig, len(mesh_objects), scale)
-
-    return {
-        'meshes': meshes,
-        'bones': bones,
-        'animations': animations
-    }
-
-
-def collect_static_data(collection, scale):
-    """Collect static object data from a collection for WAD2 export"""
-    mesh_objects = [obj for obj in collection.objects if obj.type == 'MESH']
-
-    if not mesh_objects:
-        return None
-
-    mesh_obj = mesh_objects[0]
-    mesh_data = extract_mesh_data_from_blender(mesh_obj, scale)
-
-    return {
-        'mesh': mesh_data,
-        'visibility_box': mesh_data.get('bbox'),
-        'collision_box': mesh_data.get('bbox'),
-        'flags': 0
-    }
-
-
-def export_wad2(context, filepath, import_path, scale, game='TR4'):
-    """Export WAD2 file with full mesh, texture, and animation data"""
-    from .wad import write_wad2
-
-    print("=" * 60)
-    print("Exporting WAD2 file...")
-    print(f"Export path: {filepath}")
-    print(f"Scale: {scale}")
-    print(f"Game: {game}")
-    print("=" * 60)
-
-    from . import objects
-    mov_names, static_names, _, _ = objects.get_names(game)
-
-    name_to_id = {name: int(idx) for idx, name in mov_names.items()}
-    static_name_to_id = {name: int(idx) for idx, name in static_names.items()}
-
-    wad_data = {
-        'textures': [],
-        'meshes': [],
-        'moveables': [],
-        'statics': []
-    }
-
-    options = {
-        'scale': scale,
-        'tex_width': 256,
-        'tex_height': 256
-    }
-
-    all_mesh_objects = []
-
-    movables_col = bpy.data.collections.get('Movables')
-    if movables_col:
-        print(f"\nProcessing Movables collection...")
-        for collection in movables_col.children:
-            movable_name = collection.name
-            print(f"  Processing movable: {movable_name}")
-
-            movable_id = name_to_id.get(movable_name)
-            if movable_id is None:
-                for suffix in ['_RIG', '_ANIM', '']:
-                    test_name = movable_name.replace(suffix, '')
-                    if test_name in name_to_id:
-                        movable_id = name_to_id[test_name]
-                        break
-
-            if movable_id is None:
-                match = re.search(r'(\d+)$', movable_name)
-                if match:
-                    movable_id = int(match.group(1))
-                else:
-                    movable_id = len(wad_data['moveables'])
-
-            mov_data = collect_moveable_data(collection, scale)
-            if mov_data:
-                mov_data['id'] = movable_id
-                wad_data['moveables'].append(mov_data)
-
-                mesh_objs = [obj for obj in collection.objects if obj.type == 'MESH']
-                all_mesh_objects.extend(mesh_objs)
-
-                print(f"    ID: {movable_id}, Meshes: {len(mov_data['meshes'])}, "
-                      f"Bones: {len(mov_data['bones'])}, Anims: {len(mov_data['animations'])}")
-
-    statics_col = bpy.data.collections.get('Statics')
-    if statics_col:
-        print(f"\nProcessing Statics collection...")
-        for collection in statics_col.children:
-            static_name = collection.name
-            print(f"  Processing static: {static_name}")
-
-            static_id = static_name_to_id.get(static_name)
-            if static_id is None:
-                match = re.search(r'(\d+)$', static_name)
-                if match:
-                    static_id = int(match.group(1))
-                else:
-                    static_id = len(wad_data['statics'])
-
-            static_data = collect_static_data(collection, scale)
-            if static_data:
-                static_data['id'] = static_id
-                wad_data['statics'].append(static_data)
-
-                mesh_objs = [obj for obj in collection.objects if obj.type == 'MESH']
-                all_mesh_objects.extend(mesh_objs)
-
-                print(f"    ID: {static_id}")
-
-    if all_mesh_objects:
-        textures, texture_map = extract_texture_data_from_materials(all_mesh_objects)
-        wad_data['textures'] = textures
-        print(f"\nExtracted {len(textures)} textures")
-
-    write_wad2.write_wad2(filepath, wad_data, options)
-
-    print("=" * 60)
-    print(f"Successfully exported WAD2 to: {filepath}")
-    print(f"  Moveables: {len(wad_data['moveables'])}")
-    print(f"  Statics: {len(wad_data['statics'])}")
-    print(f"  Textures: {len(wad_data['textures'])}")
-    print("=" * 60)
-
-    return {'FINISHED'}
-
-
-def export_wad(context, filepath, import_path, scale, game='TR4'):
-    """
-    Export WAD file with modified meshtree offsets.
-    Strategy: Copy entire original WAD and patch only the joints/links section
-    """
-
-    print("=" * 60)
-    print("Exporting WAD file...")
-    print(f"Import path: {import_path}")
-    print(f"Export path: {filepath}")
-    print(f"Scale: {scale}")
-    print(f"Game: {game}")
-    print("=" * 60)
-
-    if not os.path.exists(import_path):
-        raise Exception(f"Import WAD file not found: {import_path}")
-
-    from . import objects
-    mov_names, _, _, _ = objects.get_names(game)
-
-    name_to_id = {name: idx for idx, name in mov_names.items()}
-    print(f"Loaded {len(name_to_id)} movable name mappings for {game}")
-
-    with open(import_path, 'rb') as f:
-        original_data = f.read()
-
-    print(f"Read {len(original_data)} bytes from original WAD")
-
-    f = io.BytesIO(original_data)
-
-    version = read_uint32(f)
-    print(f"WAD Version: {version}")
-
-    texture_samples_count = read_uint32(f)
-    f.seek(f.tell() + texture_samples_count * 8)
-    texture_bytes = read_uint32(f)
-    f.seek(f.tell() + texture_bytes)
-    print(f"Texture section: {texture_samples_count} samples, {texture_bytes} bytes")
-
-    mesh_pointers_count = read_uint32(f)
-    f.seek(f.tell() + mesh_pointers_count * 4)
-    mesh_words_size = read_uint32(f)
-    mesh_data_start = f.tell()
-    mesh_data_size = mesh_words_size * 2
-    f.seek(f.tell() + mesh_data_size)
-    print(f"Mesh section: {mesh_pointers_count} pointers, {mesh_words_size} words")
-
-    animations_count = read_uint32(f)
-    f.seek(f.tell() + animations_count * 40)
-    state_changes_count = read_uint32(f)
-    f.seek(f.tell() + state_changes_count * 6)
-    dispatches_count = read_uint32(f)
-    f.seek(f.tell() + dispatches_count * 8)
-    commands_words_size = read_uint32(f)
-    f.seek(f.tell() + commands_words_size * 2)
-    print(f"Animation section: {animations_count} anims, {state_changes_count} changes, {dispatches_count} dispatches")
-
-    links_offset = f.tell()
-    links_dwords_size = read_uint32(f)
-    original_links_data = []
-    for _ in range(links_dwords_size):
-        original_links_data.append(read_int32(f))
-    links_end = f.tell()
-    print(f"Links section at offset {links_offset}: {links_dwords_size} dwords ({links_dwords_size * 4} bytes)")
-
-    keyframes_words_size = read_uint32(f)
-    f.seek(f.tell() + keyframes_words_size * 2)
-
-    movables_offset = f.tell()
-    movables_count = read_uint32(f)
-    print(f"Movables section at offset {movables_offset}: {movables_count} movables")
-
-    movables_data = []
-    for _ in range(movables_count):
-        mov = {
-            'obj_ID': read_uint32(f),
-            'num_pointers': struct.unpack('H', f.read(2))[0],
-            'pointers_index': struct.unpack('H', f.read(2))[0],
-            'links_index': read_uint32(f),
-            'keyframes_offset': read_uint32(f),
-            'anims_index': struct.unpack('h', f.read(2))[0]
-        }
-        movables_data.append(mov)
-        print(f"  Movable {mov['obj_ID']}: {mov['num_pointers']} meshes, links_index={mov['links_index']}")
-
-    modified_joints = {}
-
-    movables_col = bpy.data.collections.get('Movables')
-    if movables_col:
-        print(f"\nSearching for movables in Blender scene...")
-        print(f"Found {len(movables_col.children)} collections in Movables")
-
-        for collection in movables_col.children:
-            movable_name = collection.name
-            print(f"\nChecking collection: '{movable_name}'")
-
-            mesh_objects, new_joints = calculate_meshtree_offsets(collection, scale)
-            print(f"  Found {len(mesh_objects)} mesh objects, {len(new_joints)} joints")
-
-            if len(new_joints) > 0:
-                matched = False
-
-                movable_id = None
-                if movable_name in name_to_id:
-                    movable_id = int(name_to_id[movable_name])
-                    print(f"  Found ID {movable_id} from name mapping")
-
-                for mov_data in movables_data:
-                    matches = (
-                        mov_data['obj_ID'] == movable_id or
-                        movable_name.endswith(str(mov_data['obj_ID'])) or
-                        movable_name == f"MOVABLE{mov_data['obj_ID']}" or
-                        movable_name.startswith(f"MOVABLE{mov_data['obj_ID']}_") or
-                        (movable_name + '_RIG').startswith(f"MOVABLE{mov_data['obj_ID']}")
-                    )
-
-                    if matches:
-                        links_index = mov_data['links_index']
-                        num_joints = mov_data['num_pointers'] - 1
-
-                        print(f"  Matched with movable ID {mov_data['obj_ID']} ({num_joints} joints expected, {len(new_joints)} found)")
-
-                        if len(new_joints) == num_joints:
-                            preserved_joints = []
-                            for i, new_joint in enumerate(new_joints):
-                                base_idx = links_index + i * 4
-                                if base_idx < len(original_links_data):
-                                    original_op = original_links_data[base_idx]
-                                    preserved_joints.append([original_op, new_joint[1], new_joint[2], new_joint[3]])
-                                else:
-                                    preserved_joints.append(new_joint)
-
-                            modified_joints[links_index] = preserved_joints
-                            print(f"  Will update {movable_name} (ID {mov_data['obj_ID']}): {num_joints} joints at links_index {links_index}")
-                            matched = True
-                        else:
-                            print(f"  WARNING: {movable_name} joint count mismatch: expected {num_joints}, got {len(new_joints)}")
-                        break
-
-                if not matched:
-                    print(f"  No matching movable ID found for '{movable_name}'")
-            else:
-                print(f"  Skipped: no joints found")
-    else:
-        print("\nNo 'Movables' collection found in scene")
-
-    new_links_data = original_links_data.copy()
-
-    for links_index, new_joints in modified_joints.items():
-        for i, joint in enumerate(new_joints):
-            base_idx = links_index + i * 4
-            if base_idx + 3 < len(new_links_data):
-                new_links_data[base_idx] = joint[0]
-                new_links_data[base_idx + 1] = joint[1]
-                new_links_data[base_idx + 2] = joint[2]
-                new_links_data[base_idx + 3] = joint[3]
-                print(f"  Patched joint at index {base_idx}: op={joint[0]}, dx={joint[1]}, dy={joint[2]}, dz={joint[3]}")
-
-    with open(filepath, 'wb') as out:
-        out.write(original_data[:links_offset])
-
-        write_uint32(out, len(new_links_data))
-        for value in new_links_data:
-            write_int32(out, value)
-
-        out.write(original_data[links_end:])
-
-    print("=" * 60)
-    print(f"Successfully exported WAD to: {filepath}")
-    print(f"  Patched {len(modified_joints)} movables")
-    print("=" * 60)
-
-    return {'FINISHED'}
-
-
 class ExportWAD(bpy.types.Operator, ExportHelper):
-    """Export modified movable to WAD/WAD2 file"""
+    """Export scene to WAD or WAD2 file"""
     bl_idname = "export_scene.wad"
     bl_label = "Export WAD"
     bl_options = {'PRESET'}
 
-    filename_ext = ".wad"
+    filename_ext = ".wad2"
 
     filter_glob: StringProperty(
-        default="*.wad",
+        default="*.wad;*.wad2",
         options={'HIDDEN'},
     )
 
@@ -783,7 +839,7 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
 
     scale: FloatProperty(
         name="Scale",
-        description="Scale factor for converting Blender units to TR units",
+        description="Scale factor (Blender units → TR units)",
         default=512.0,
         min=1.0,
         max=10000.0
@@ -791,8 +847,9 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
 
     game: EnumProperty(
         name="Game",
-        description="Game version for movable name mapping",
+        description="Target game version",
         items=[
+            ('TEN', "TEN (Tomb Engine)", ""),
             ('TR4', "TR4", ""),
             ('TR5', "TR5", ""),
             ('TR5Main', "TR5Main", ""),
@@ -800,23 +857,17 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
             ('TR2', "TR2", ""),
             ('TR1', "TR1", ""),
         ],
-        default='TR4',
+        default='TEN',
     )
 
     export_format: EnumProperty(
         name="Format",
         description="Export format",
         items=[
-            ('WAD', "Classic WAD", "Export as classic WAD format (requires original WAD)"),
-            # ('WAD2', "WAD2", "Export as WAD2 format (DISABLED - unstable)"),
+            ('WAD2', "WAD2", "Export as WAD2 (for Tomb Editor / TEN)"),
+            ('WAD',  "Classic WAD", "Patch meshtree offsets in original WAD"),
         ],
-        default='WAD',
-    )
-
-    export_textures: BoolProperty(
-        name="Export Textures",
-        description="Include texture data in WAD2 export",
-        default=True,
+        default='WAD2',
     )
 
     export_animations: BoolProperty(
@@ -826,70 +877,59 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
     )
 
     def execute(self, context):
-        # Classic WAD export only
-        if not self.import_path or not os.path.exists(self.import_path):
-            self.report({'ERROR'}, "Classic WAD export requires original WAD file. Please specify the original WAD path.")
-            return {'CANCELLED'}
-
-        # Ensure .wad extension
-        if not self.filepath.lower().endswith('.wad'):
-            self.filepath = os.path.splitext(self.filepath)[0] + '.wad'
-
-        return export_wad(context, self.filepath, self.import_path, self.scale, self.game)
+        if self.export_format == 'WAD2':
+            if not self.filepath.lower().endswith('.wad2'):
+                self.filepath = os.path.splitext(self.filepath)[0] + '.wad2'
+            return export_wad2(context, self.filepath, self.scale,
+                               self.game, self.export_animations)
+        else:
+            if not self.import_path or not os.path.exists(self.import_path):
+                self.report({'ERROR'},
+                            "Classic WAD export requires the original WAD file.")
+                return {'CANCELLED'}
+            if not self.filepath.lower().endswith('.wad'):
+                self.filepath = os.path.splitext(self.filepath)[0] + '.wad'
+            return export_wad(context, self.filepath, self.import_path,
+                              self.scale, self.game)
 
     def invoke(self, context, event):
-        # Auto-detect original WAD path from import
         if hasattr(context.scene, 'wad_import_path') and context.scene.wad_import_path:
             self.import_path = context.scene.wad_import_path
-            print(f"Auto-detected original WAD: {self.import_path}")
-        else:
-            print("No original WAD path found - you'll need to specify it manually")
-
+            if self.import_path.lower().endswith('.wad2'):
+                self.export_format = 'WAD2'
+                self.filename_ext = '.wad2'
         return super().invoke(context, event)
 
     def draw(self, context):
         layout = self.layout
-
         box = layout.box()
-        box.label(text="WAD Export Settings", icon="EXPORT")
+        box.label(text="Export Settings", icon="EXPORT")
 
-        row = box.row()
-        row.prop(self, "export_format")
+        box.prop(self, "export_format")
 
         if self.export_format == 'WAD':
-            row = box.row()
-            row.prop(self, "import_path")
-
+            box.prop(self, "import_path")
             if self.import_path:
-                row = box.row()
-                row.label(text=f"Using: {os.path.basename(self.import_path)}", icon="FILE")
+                box.label(text=f"Using: {os.path.basename(self.import_path)}",
+                          icon="FILE")
             else:
-                row = box.row()
-                row.label(text="No original WAD specified", icon="ERROR")
-                row = box.row()
-                row.label(text="Classic WAD export requires original file")
+                box.label(text="Original WAD file required", icon="ERROR")
         else:
-            row = box.row()
-            row.prop(self, "export_textures")
-            row = box.row()
-            row.prop(self, "export_animations")
+            box.prop(self, "export_animations")
 
         box.separator()
-        row = box.row()
-        row.prop(self, "scale")
-
-        row = box.row()
-        row.prop(self, "game")
+        box.prop(self, "scale")
+        box.prop(self, "game")
 
 
 def menu_func_export(self, context):
-    self.layout.operator(ExportWAD.bl_idname, text="Tomb Raider WAD (.wad)")
+    self.layout.operator(ExportWAD.bl_idname,
+                         text="Tomb Raider WAD (.wad/.wad2)")
 
 
 def register():
     bpy.utils.register_class(ExportWAD)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
-
     bpy.types.Scene.wad_import_path = StringProperty(
         name="WAD Import Path",
         description="Path to the imported WAD file",
@@ -900,7 +940,6 @@ def register():
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     bpy.utils.unregister_class(ExportWAD)
-
     del bpy.types.Scene.wad_import_path
 
 
