@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 
 def get_partial_names(version):
     cur_script_path = os.path.dirname(os.path.realpath(__file__))
-    filename = cur_script_path + '\\resources\\trcatalog.xml'
+    filename = os.path.join(cur_script_path, 'resources', 'trcatalog.xml')
     tree = ET.parse(filename)
     root = tree.getroot()
 
@@ -76,7 +76,7 @@ def get_partial_names(version):
 def get_names(ver):
     movables, statics, animations, states = get_partial_names(ver)
 
-    for g in ['TR1', 'TR2', 'TR3', 'TR4', 'TR5', 'TR5Main']:
+    for g in ['TR1', 'TR2', 'TR3', 'TR4', 'TRNG', 'TR5', 'TEN']:
         if g == ver:
             break
 

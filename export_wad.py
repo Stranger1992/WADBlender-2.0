@@ -720,8 +720,9 @@ def export_wad2(context, filepath, scale, game, export_anims=True):
 
 
 def _game_to_version(game_str):
+    # Version numbers from TRVersion.Game enum in TombLib
     return {'TR1': 1, 'TR2': 2, 'TR3': 3, 'TR4': 4,
-            'TR5': 5, 'TR5Main': 5, 'TEN': 4}.get(game_str, 4)
+            'TRNG': 16, 'TR5': 5, 'TEN': 18}.get(game_str, 4)
 
 
 # ============================================================================
@@ -928,13 +929,13 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
         name="Game",
         description="Target game version",
         items=[
-            ('TEN', "TEN (Tomb Engine)", ""),
-            ('TR4', "TR4", ""),
-            ('TR5', "TR5", ""),
-            ('TR5Main', "TR5Main", ""),
-            ('TR3', "TR3", ""),
-            ('TR2', "TR2", ""),
-            ('TR1', "TR1", ""),
+            ('TEN',  "TEN (Tomb Engine)",  "Tomb Engine Next (TEN) – modern open-source engine"),
+            ('TR4',  "TR4 / TRLE",         "Tomb Raider IV: The Last Revelation"),
+            ('TRNG', "TRNG",               "Tomb Raider Next Generation (TRNG) – TR4 mod"),
+            ('TR5',  "TR5",                "Tomb Raider V: Chronicles"),
+            ('TR3',  "TR3",                "Tomb Raider III: Adventures of Lara Croft"),
+            ('TR2',  "TR2",                "Tomb Raider II: Starring Lara Croft"),
+            ('TR1',  "TR1",                "Tomb Raider I: The Original"),
         ],
         default='TEN',
     )
