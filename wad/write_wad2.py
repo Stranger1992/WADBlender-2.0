@@ -297,9 +297,10 @@ class ChunkWriter:
         self.stream.write(struct.pack('?', value))
 
     def write_raw_string_utf8(self, text: str):
-        """Write a LEB128-length-prefixed UTF-8 string (no chunk framing)."""
+        """Write a 4-byte-int32-length-prefixed UTF-8 string (no chunk framing).
+        Matches BinaryWriterFast.WriteStringUTF8 / BinaryReaderEx.ReadStringUTF8."""
         encoded = text.encode('utf-8')
-        write_leb128_signed(self.stream, len(encoded))
+        self.stream.write(struct.pack('<i', len(encoded)))  # 4-byte signed int32
         self.stream.write(encoded)
 
     def write_raw_int32(self, value: int):
