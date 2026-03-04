@@ -142,14 +142,17 @@ def _extract_mesh(mesh_obj, textures, img_to_idx, scale):
     eval_mesh = eval_obj.data
 
     # -- Positions (float, scaled) --
+    # Blender (Z-up, Y-forward) → WAD2 (Y-up): inverse of _fix_axis_vec3 = (-bx, bz, -by)
     positions = []
     for v in eval_mesh.vertices:
-        positions.append((v.co.x * scale, v.co.y * scale, v.co.z * scale))
+        positions.append((-v.co.x * scale, v.co.z * scale, -v.co.y * scale))
 
     # -- Normals --
+    # Same inverse axis transform, then negate for handedness flip (det=-1 reversal)
+    # Result: (nx, -nz, ny)
     normals = []
     for v in eval_mesh.vertices:
-        normals.append((v.normal.x, v.normal.y, v.normal.z))
+        normals.append((v.normal.x, -v.normal.z, v.normal.y))
 
     # -- Vertex colours (from "shade" colour attribute if present) --
     colors = []
@@ -301,11 +304,13 @@ def _extract_bones(rig, mesh_objects, scale):
                               'translation': (0.0, 0.0, 0.0), 'mesh_index': 0})
             else:
                 prev = mesh_objects[i - 1]
-                dx = (obj.location.x - prev.location.x) * scale
-                dy = (obj.location.y - prev.location.y) * scale
-                dz = (obj.location.z - prev.location.z) * scale
+                # Blender→WAD2: inverse of _fix_axis_vec3 = (-Δbx, Δbz, -Δby)
+                dbx = obj.location.x - prev.location.x
+                dby = obj.location.y - prev.location.y
+                dbz = obj.location.z - prev.location.z
                 bones.append({'op': 0, 'name': obj.name,
-                              'translation': (dx, dy, dz), 'mesh_index': i})
+                              'translation': (-dbx * scale, dbz * scale, -dby * scale),
+                              'mesh_index': i})
         return bones
 
     # Build a mapping: mesh_name → armature bone
@@ -330,13 +335,17 @@ def _extract_bones(rig, mesh_objects, scale):
             parent_name = bone.parent.name
             parent_mesh = next((m for m in mesh_objects if m.name == parent_name), None)
             if parent_mesh:
-                dx = (mesh_obj.location.x - parent_mesh.location.x) * scale
-                dy = (mesh_obj.location.y - parent_mesh.location.y) * scale
-                dz = (mesh_obj.location.z - parent_mesh.location.z) * scale
+                dbx = mesh_obj.location.x - parent_mesh.location.x
+                dby = mesh_obj.location.y - parent_mesh.location.y
+                dbz = mesh_obj.location.z - parent_mesh.location.z
             else:
-                dx = mesh_obj.location.x * scale
-                dy = mesh_obj.location.y * scale
-                dz = mesh_obj.location.z * scale
+                dbx = mesh_obj.location.x
+                dby = mesh_obj.location.y
+                dbz = mesh_obj.location.z
+            # Blender→WAD2: inverse of _fix_axis_vec3 = (-Δbx, Δbz, -Δby)
+            dx = -dbx * scale
+            dy =  dbz * scale
+            dz = -dby * scale
 
             # Determine stack opcode from sibling structure
             siblings = list(bone.parent.children)
@@ -353,9 +362,13 @@ def _extract_bones(rig, mesh_objects, scale):
         else:
             # Orphan bone or no parent info — chain
             prev = mesh_objects[i - 1]
-            dx = (mesh_obj.location.x - prev.location.x) * scale
-            dy = (mesh_obj.location.y - prev.location.y) * scale
-            dz = (mesh_obj.location.z - prev.location.z) * scale
+            dbx = mesh_obj.location.x - prev.location.x
+            dby = mesh_obj.location.y - prev.location.y
+            dbz = mesh_obj.location.z - prev.location.z
+            # Blender→WAD2: inverse of _fix_axis_vec3 = (-Δbx, Δbz, -Δby)
+            dx = -dbx * scale
+            dy =  dbz * scale
+            dz = -dby * scale
             op = 0
 
         bones.append({
