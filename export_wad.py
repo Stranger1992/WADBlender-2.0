@@ -310,8 +310,9 @@ def _extract_bones(rig, mesh_objects, scale):
     if not rig or rig.type != 'ARMATURE':
         # No armature → simple linear chain (all NotUseStack)
         for i, obj in enumerate(mesh_objects):
+            bone_name = 'bone_0_root' if i == 0 else f'bone_{i}'
             if i == 0:
-                bones.append({'op': 0, 'name': obj.name,
+                bones.append({'op': 0, 'name': bone_name,
                               'translation': (0.0, 0.0, 0.0), 'mesh_index': 0})
             else:
                 prev = mesh_objects[i - 1]
@@ -319,7 +320,7 @@ def _extract_bones(rig, mesh_objects, scale):
                 dbx = obj.location.x - prev.location.x
                 dby = obj.location.y - prev.location.y
                 dbz = obj.location.z - prev.location.z
-                bones.append({'op': 0, 'name': obj.name,
+                bones.append({'op': 0, 'name': bone_name,
                               'translation': (-dbx * scale, dbz * scale, -dby * scale),
                               'mesh_index': i})
         return bones
@@ -335,7 +336,7 @@ def _extract_bones(rig, mesh_objects, scale):
             # Root — always Push, zero translation
             bones.append({
                 'op':          0,
-                'name':        mesh_obj.name,
+                'name':        'bone_0_root',
                 'translation': (0.0, 0.0, 0.0),
                 'mesh_index':  0,
             })
@@ -384,7 +385,7 @@ def _extract_bones(rig, mesh_objects, scale):
 
         bones.append({
             'op':          op,
-            'name':        mesh_obj.name,
+            'name':        f'bone_{i}',
             'translation': (dx, dy, dz),
             'mesh_index':  i,
         })
