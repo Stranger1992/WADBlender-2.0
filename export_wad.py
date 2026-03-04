@@ -399,9 +399,19 @@ def _extract_animations(rig, mesh_objects, scale):
     """
     Extract all NLA-strip / active-action animations from an armature.
     Returns list of animation dicts for write_wad2.
+
+    Angles are stored as (pitch_deg, yaw_deg, roll_deg) in WAD space,
+    matching WadKeyFrameRotation.Rotations (degrees).
     """
     if not rig or rig.type != 'ARMATURE' or not rig.animation_data:
         return []
+
+    # Reuse the working conversion helpers from the .anim exporter.
+    from .export_anim import (
+        AXIS_MAT, AXIS_MAT_T, _get_action_fcurves,
+        _build_curve_map, _evaluate_quat,
+        _mat_to_yaw_pitch_roll, _blender_to_wad_vec,
+    )
 
     # Collect unique actions from NLA tracks and active action
     actions = []
@@ -428,10 +438,14 @@ def _extract_animations(rig, mesh_objects, scale):
         frame_start = int(action.frame_range[0])
         frame_end   = int(action.frame_range[1])
 
+        # Use the slot-aware fcurve getter (handles new Blender action API)
+        fcurves   = _get_action_fcurves(rig, action)
+        curve_map = _build_curve_map(fcurves)
+
         # Gather unique keyframe positions from fcurves
         kf_frames = sorted(set(
             int(kp.co[0])
-            for fc in action.fcurves
+            for fc in fcurves
             for kp in fc.keyframe_points
             if frame_start <= int(kp.co[0]) <= frame_end
         ))
@@ -443,27 +457,42 @@ def _extract_animations(rig, mesh_objects, scale):
             bpy.context.scene.frame_set(frame)
             bpy.context.view_layer.update()
 
-            kf = {
-                'offset':  (0.0, 0.0, 0.0),
-                'bb_min':  (0.0, 0.0, 0.0),
-                'bb_max':  (0.0, 0.0, 0.0),
-                'angles':  [],
-            }
-
-            # Root bone offset
+            # Root bone offset: Blender → WAD space
+            root_offset = (0.0, 0.0, 0.0)
             if bone_names and bone_names[0] in rig.pose.bones:
-                loc = rig.pose.bones[bone_names[0]].location
-                kf['offset'] = (loc.x * scale, loc.y * scale, loc.z * scale)
+                root_loc_path = f'pose.bones["{bone_names[0]}"].location'
+                loc = [0.0, 0.0, 0.0]
+                for axis in range(3):
+                    fc = curve_map.get((root_loc_path, axis))
+                    if fc:
+                        loc[axis] = fc.evaluate(frame) * scale
+                root_offset = _blender_to_wad_vec(loc)
 
-            # Euler rotations per bone
+            # Per-bone angles: convert quaternion → WAD rotation matrix
+            # → extract yaw/pitch/roll in degrees (pitch, yaw, roll).
+            # Matches WadKeyFrameRotation.Rotations storage format.
+            angles = []
             for bn in bone_names:
                 if bn in rig.pose.bones:
-                    rot = rig.pose.bones[bn].rotation_euler
-                    kf['angles'].append((rot.x, rot.y, rot.z))
+                    bone = rig.pose.bones[bn]
+                    q      = _evaluate_quat(curve_map, bone, frame)
+                    mat_b  = q.to_matrix()
+                    mat_w  = AXIS_MAT_T @ mat_b @ AXIS_MAT
+                    yaw, pitch, roll = _mat_to_yaw_pitch_roll(mat_w)
+                    angles.append((
+                        math.degrees(pitch),
+                        math.degrees(yaw),
+                        math.degrees(roll),
+                    ))
                 else:
-                    kf['angles'].append((0.0, 0.0, 0.0))
+                    angles.append((0.0, 0.0, 0.0))
 
-            keyframes.append(kf)
+            keyframes.append({
+                'offset':  root_offset,
+                'bb_min':  (0.0, 0.0, 0.0),
+                'bb_max':  (0.0, 0.0, 0.0),
+                'angles':  angles,
+            })
 
         # Read optional custom properties from the action
         state_id   = int(action.get('state_id', 0))
@@ -596,6 +625,31 @@ def export_wad2(context, filepath, scale, game, export_anims=True):
             animations = []
             if export_anims:
                 animations = _extract_animations(rig, mesh_objects, scale)
+
+            if not animations:
+                # WadTool requires at least one animation with one keyframe to
+                # call BuildHierarchy/BuildAnimationPose and display all meshes.
+                # Generate a minimal rest-pose animation as fallback.
+                animations = [{
+                    'state_id':               0,
+                    'end_frame':              0,
+                    'frame_rate':             1,
+                    'next_animation':         0,
+                    'next_frame':             0,
+                    'name':                   'DEFAULT',
+                    'keyframes': [{
+                        'offset':  (0.0, 0.0, 0.0),
+                        'bb_min':  (0.0, 0.0, 0.0),
+                        'bb_max':  (0.0, 0.0, 0.0),
+                        'angles':  [(0.0, 0.0, 0.0)] * len(mesh_objects),
+                    }],
+                    'state_changes':          [],
+                    'commands':               [],
+                    'start_velocity':         0.0,
+                    'end_velocity':           0.0,
+                    'start_lateral_velocity': 0.0,
+                    'end_lateral_velocity':   0.0,
+                }]
 
             moveables.append({
                 'id':         mov_id,
