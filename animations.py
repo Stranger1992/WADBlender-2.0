@@ -4,7 +4,14 @@ from collections import defaultdict
 
 import bpy
 from bpy_extras import anim_utils
-from mathutils import Euler, Quaternion
+from mathutils import Euler, Matrix, Quaternion
+
+# Coordinate-system change matrix: WAD/TR axes → Blender axes.
+# Must match the matrix used in export_anim.py (AXIS_MAT) and read_wad2.py.
+_AXIS_MAT   = Matrix(((-1.0, 0.0, 0.0),
+                      ( 0.0, 0.0,-1.0),
+                      ( 0.0, 1.0, 0.0)))
+_AXIS_MAT_T = _AXIS_MAT.transposed()
 
 
 def create_animations(item_idx, rig, bonenames, animations, options):
@@ -13,20 +20,31 @@ def create_animations(item_idx, rig, bonenames, animations, options):
 
     for idx, animation in enumerate(animations):
         if item_idx in options.anim_names and str(idx) in options.anim_names[item_idx]:
-            name = ' - '.join((rig.name, str(idx).zfill(3), options.anim_names[item_idx][str(idx)])) 
+            name = ' - '.join((rig.name, str(idx).zfill(3), options.anim_names[item_idx][str(idx)]))
         else:
-            name = ' - '.join((rig.name, str(idx).zfill(3))) 
+            name = ' - '.join((rig.name, str(idx).zfill(3)))
         action = bpy.data.actions.new(name)
+
+        # Detect import source: WAD2 stores 4-tuple quaternions; WAD1 stores
+        # 3-tuple ZXY Euler angles (radians, TR space, Y-down).
+        is_wad1 = (bool(animation.keyFrames) and
+                   bool(animation.keyFrames[0].rotations) and
+                   len(animation.keyFrames[0].rotations[0]) != 4)
 
         offsets = [keyframe.offset for keyframe in animation.keyFrames]
         rotations = defaultdict(list)
         for keyframe in animation.keyFrames:
             for bonename, rot in zip(bonenames, keyframe.rotations):
                 if len(rot) == 4:
+                    # WAD2 path: quaternion already in Blender space.
                     quat = Quaternion(rot)
                 else:
-                    angle = Euler(rot, 'ZXY')
-                    quat = angle.to_quaternion()
+                    # WAD1 path: ZXY Euler in TR space.
+                    # Apply the same axis conversion as WAD2 import so that
+                    # the export (which undoes this via AXIS_MAT_T @ M @ AXIS_MAT)
+                    # produces the correct WAD2 rotation values.
+                    mat_wad = Euler(rot, 'ZXY').to_matrix()
+                    quat = (_AXIS_MAT @ mat_wad @ _AXIS_MAT_T).to_quaternion()
                 rotations[bonename].append(quat)
 
         # Blender 5.0+ uses channelbags instead of direct action.fcurves
@@ -53,8 +71,16 @@ def create_animations(item_idx, rig, bonenames, animations, options):
             keyframe_points = fc.keyframe_points
             keyframe_points.add(len(offsets))
             for j, val in enumerate(offsets):
-                k = 0
-                v = val[axis]
+                if is_wad1:
+                    # WAD1 offset is (vx, vy, vz) in TR space (Y-down).
+                    # Convert to Blender (-vx, -vz, -vy) so the export's
+                    # _blender_to_wad_vec produces (vx, -vy, vz), matching
+                    # what WadTool outputs when converting WAD1 → WAD2.
+                    converted = (-val[0], -val[2], -val[1])
+                    v = converted[axis]
+                else:
+                    # WAD2: offset already in Blender space from _fix_axis_vec3.
+                    v = val[axis]
 
                 keyframe_points[j].co = (j, v / options.scale)
 

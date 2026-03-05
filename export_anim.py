@@ -153,6 +153,8 @@ def _evaluate_quat(curve_map, bone, frame):
 
 
 def export_anim(filepath, rig_name, scale, frame_rate):
+    import json as _json
+
     if os.path.exists(filepath):
         tree = ET.parse(filepath)
         root = tree.getroot()
@@ -183,7 +185,13 @@ def export_anim(filepath, rig_name, scale, frame_rate):
         raise ValueError("Selected armature has no bones.")
 
     root_bone = bones[0].name
+
+    # frame_rate (UI prop) = sampling step in Blender frames.
+    # xml_frame_rate = WAD frame duration stored as custom property (how many
+    # game frames each keyframe lasts).  Falls back to the UI value if no
+    # custom property is present.
     frame_rate = max(1, int(frame_rate))
+    xml_frame_rate = int(action.get('frame_rate', frame_rate))
 
     start, end = action.frame_range
     start = int(math.floor(start))
@@ -194,9 +202,18 @@ def export_anim(filepath, rig_name, scale, frame_rate):
     if not frames:
         frames = [start]
 
-    _get_or_create(root, "FrameRate").text = str(frame_rate)
-    _get_or_create(root, "EndFrame").text = str(frame_rate * (len(frames) - 1))
+    # Write all animation metadata from stored custom properties.
+    _get_or_create(root, "FrameRate").text = str(xml_frame_rate)
+    # EndFrame = frame_duration × num_keyframes (matches Tomb Editor convention).
+    _get_or_create(root, "EndFrame").text = str(xml_frame_rate * len(frames))
+    _get_or_create(root, "StateId").text = str(int(action.get('state_id', 0)))
+    _get_or_create(root, "NextAnimation").text = str(int(action.get('next_animation', 0)))
+    _get_or_create(root, "NextFrame").text = str(int(action.get('next_frame', 0)))
     _get_or_create(root, "Name").text = action.name
+    _get_or_create(root, "StartVelocity").text = str(float(action.get('start_velocity', 0)))
+    _get_or_create(root, "EndVelocity").text = str(float(action.get('end_velocity', 0)))
+    _get_or_create(root, "StartLateralVelocity").text = str(float(action.get('start_lateral_velocity', 0)))
+    _get_or_create(root, "EndLateralVelocity").text = str(float(action.get('end_lateral_velocity', 0)))
 
     root_loc_path = f'pose.bones["{root_bone}"].location'
 
@@ -238,6 +255,50 @@ def export_anim(filepath, rig_name, scale, frame_rate):
             ET.SubElement(rot, "X").text = "%.6f" % math.degrees(pitch)
             ET.SubElement(rot, "Y").text = "%.6f" % math.degrees(yaw)
             ET.SubElement(rot, "Z").text = "%.6f" % math.degrees(roll)
+
+    # Write StateChanges from custom property JSON.
+    sc_node = root.find("StateChanges")
+    if sc_node is None:
+        sc_node = ET.SubElement(root, "StateChanges")
+    for child in list(sc_node):
+        sc_node.remove(child)
+
+    sc_raw = action.get('state_changes')
+    if sc_raw and isinstance(sc_raw, str):
+        try:
+            sc_list = _json.loads(sc_raw)
+            for sc_entry in sc_list:
+                wsc = ET.SubElement(sc_node, "WadStateChange")
+                ET.SubElement(wsc, "StateId").text = str(int(sc_entry.get('state_id', 0)))
+                dispatches_node = ET.SubElement(wsc, "Dispatches")
+                for d in sc_entry.get('dispatches', []):
+                    wad_d = ET.SubElement(dispatches_node, "WadAnimDispatch")
+                    ET.SubElement(wad_d, "InFrame").text = str(int(d.get('in_frame', 0)))
+                    ET.SubElement(wad_d, "OutFrame").text = str(int(d.get('out_frame', 0)))
+                    ET.SubElement(wad_d, "NextAnimation").text = str(int(d.get('next_animation', 0)))
+                    ET.SubElement(wad_d, "NextFrame").text = str(int(d.get('next_frame', 0)))
+        except Exception:
+            pass
+
+    # Write AnimCommands from custom property JSON.
+    cmd_node = root.find("AnimCommands")
+    if cmd_node is None:
+        cmd_node = ET.SubElement(root, "AnimCommands")
+    for child in list(cmd_node):
+        cmd_node.remove(child)
+
+    cmd_raw = action.get('anim_commands')
+    if cmd_raw and isinstance(cmd_raw, str):
+        try:
+            cmd_list = _json.loads(cmd_raw)
+            for cmd in cmd_list:
+                wac = ET.SubElement(cmd_node, "WadAnimCommand")
+                ET.SubElement(wac, "Type").text = str(int(cmd.get('type', 0)))
+                ET.SubElement(wac, "Parameter1").text = str(int(cmd.get('param1', 0)))
+                ET.SubElement(wac, "Parameter2").text = str(int(cmd.get('param2', 0)))
+                ET.SubElement(wac, "Parameter3").text = str(int(cmd.get('param3', 0)))
+        except Exception:
+            pass
 
     tree.write(filepath, encoding=encoding, xml_declaration=True)
 
