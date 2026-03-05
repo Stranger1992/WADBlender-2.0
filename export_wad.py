@@ -531,47 +531,47 @@ def _extract_animations(rig, mesh_objects, scale):
                     'angles':  angles,
                 })
 
-        # Read optional custom properties from the action
-        state_id   = int(action.get('state_id', 0))
-        next_anim  = int(action.get('next_animation', 0))
-        next_frame = int(action.get('next_frame', 0))
-        frame_rate = int(action.get('frame_rate', 1))
+            # Read optional custom properties from the action
+            state_id   = int(action.get('state_id', 0))
+            next_anim  = int(action.get('next_animation', 0))
+            next_frame = int(action.get('next_frame', 0))
+            frame_rate = int(action.get('frame_rate', 1))
 
-        # State changes from custom prop (JSON list if present)
-        state_changes = []
-        sc_raw = action.get('state_changes')
-        if sc_raw and isinstance(sc_raw, str):
-            import json
-            try:
-                state_changes = json.loads(sc_raw)
-            except Exception:
-                pass
+            # State changes from custom prop (JSON list if present)
+            state_changes = []
+            sc_raw = action.get('state_changes')
+            if sc_raw and isinstance(sc_raw, str):
+                import json
+                try:
+                    state_changes = json.loads(sc_raw)
+                except Exception:
+                    pass
 
-        # Anim commands
-        commands = []
-        cmd_raw = action.get('anim_commands')
-        if cmd_raw and isinstance(cmd_raw, str):
-            import json
-            try:
-                commands = json.loads(cmd_raw)
-            except Exception:
-                pass
+            # Anim commands
+            commands = []
+            cmd_raw = action.get('anim_commands')
+            if cmd_raw and isinstance(cmd_raw, str):
+                import json
+                try:
+                    commands = json.loads(cmd_raw)
+                except Exception:
+                    pass
 
-        animations.append({
-            'state_id':                state_id,
-            'end_frame':               len(keyframes) * frame_rate,
-            'frame_rate':              frame_rate,
-            'next_animation':          next_anim,
-            'next_frame':              next_frame,
-            'name':                    action.name,
-            'keyframes':               keyframes,
-            'state_changes':           state_changes,
-            'commands':                commands,
-            'start_velocity':          float(action.get('start_velocity', 0)),
-            'end_velocity':            float(action.get('end_velocity', 0)),
-            'start_lateral_velocity':  float(action.get('start_lateral_velocity', 0)),
-            'end_lateral_velocity':    float(action.get('end_lateral_velocity', 0)),
-        })
+            animations.append({
+                'state_id':                state_id,
+                'end_frame':               len(keyframes) * frame_rate,
+                'frame_rate':              frame_rate,
+                'next_animation':          next_anim,
+                'next_frame':              next_frame,
+                'name':                    action.name,
+                'keyframes':               keyframes,
+                'state_changes':           state_changes,
+                'commands':                commands,
+                'start_velocity':          float(action.get('start_velocity', 0)),
+                'end_velocity':            float(action.get('end_velocity', 0)),
+                'start_lateral_velocity':  float(action.get('start_lateral_velocity', 0)),
+                'end_lateral_velocity':    float(action.get('end_lateral_velocity', 0)),
+            })
 
     finally:
         # Restore NLA mute states, active action, slot and frame.
@@ -976,7 +976,7 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
         name="Game",
         description="Target game version",
         items=[
-            ('TEN',  "TEN (Tomb Engine)",  "Tomb Engine Next (TEN) – modern open-source engine"),
+            ('TEN',  "Tomb Engine",        "Tomb Engine – modern open-source engine with skinned objects and advanced features"),
             ('TR4',  "TR4 / TRLE",         "Tomb Raider IV: The Last Revelation"),
             ('TRNG', "TRNG",               "Tomb Raider Next Generation (TRNG) – TR4 mod"),
             ('TR5',  "TR5",                "Tomb Raider V: Chronicles"),
@@ -991,7 +991,7 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
         name="Format",
         description="Export format",
         items=[
-            ('WAD2', "WAD2", "Export as WAD2 (for Tomb Editor / TEN)"),
+            ('WAD2', "WAD2", "Export as WAD2 (for Tomb Editor / Tomb Engine)"),
             ('WAD',  "Classic WAD", "Patch meshtree offsets in original WAD"),
         ],
         default='WAD2',

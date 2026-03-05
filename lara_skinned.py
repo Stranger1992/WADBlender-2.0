@@ -8,7 +8,7 @@ from .create_materials import apply_textures, pack_textures
 from .objects import lara_skin_names, lara_skin_joints_names
 
 
-# Bone name mapping from Lara mesh names to TEN format
+# Bone name mapping from Lara mesh names to Tomb Engine format
 BONE_RENAME_MAP = {
     'LARA_HIPS_BONE': 'Mesh_12',
     'LARA_LEFT_THIGH_BONE': 'Mesh_13',
@@ -195,10 +195,10 @@ def paint_vertex(mesh):
 
 
 def main(context, materials, wad, options):
-    """Import only LARA with skinned mesh and TEN bone names"""
+    """Import only LARA with skinned mesh and Tomb Engine bone names"""
 
     print("=" * 60)
-    print("Importing Lara's Outfit (Skinned) with TEN bone names...")
+    print("Importing Lara's Outfit (Skinned) with Tomb Engine bone names...")
     print("=" * 60)
 
     # Create collection (clean up any existing one first)
@@ -302,7 +302,7 @@ def main(context, materials, wad, options):
     create_lara_skeleton(rig, pivot_points['LARA_SKIN'], movables['LARA_SKIN'],
                         movables['LARA_SKIN_JOINTS'], bonesfile, vertexfile, options.scale, options.is_wad2)
 
-    # Rename bones to TEN format
+    # Rename bones to Tomb Engine format
     # Make sure we're in EDIT mode to rename bones
     bpy.context.view_layer.objects.active = rig
     if rig.mode != 'EDIT':
@@ -368,6 +368,6 @@ def main(context, materials, wad, options):
         rig.rotation_euler[0] = math.pi/2
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-    print(f"Successfully imported skinned Lara with TEN bone names")
+    print(f"Successfully imported skinned Lara with Tomb Engine bone names")
     print("Bones renamed to Mesh_12 through Mesh_26")
     print("=" * 60)

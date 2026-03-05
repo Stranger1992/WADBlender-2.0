@@ -49,7 +49,7 @@ class ImportWADContext:
     static_names = {}
     anim_names = {}
     state_names = {}
-    for game in ['TR1', 'TR2', 'TR3', 'TR4', 'TR5', 'TR5Main']:
+    for game in ['TR1', 'TR2', 'TR3', 'TR4', 'TR5', 'TEN']:
         mov_names[game], static_names[game], \
         anim_names[game], state_names[game] = objects.get_names(game)
         rename_dups(mov_names[game])
@@ -88,7 +88,7 @@ class ImportWAD(Operator, ImportHelper):
         items=(
             ('OPT_LARA', "Lara Full Model", "Import all Lara objects"),
             ('OPT_OUTFIT', "Lara's Outfit", "Import only LARA_SKIN and LARA_SKIN_JOINTS meshes"),
-            ('OPT_OUTFIT_SKINNED', "Lara's Outfit (Skinned)", "Import Lara's outfit with skinning/armature for TEN"),
+            ('OPT_OUTFIT_SKINNED', "Lara's Outfit (Skinned)", "Import Lara's outfit with skinning/armature for Tomb Engine"),
             ('OPT_MOVABLES', "All Movables", "Import all Movable objects"),
             ('OPT_STATICS', "All Statics", "Import all Static objects"),
             ('OPT_EVERYTHING', "Everything", "Import Everything"),
@@ -228,7 +228,7 @@ class ImportWAD(Operator, ImportHelper):
             ('TR3', "TR3", ""),
             ('TR4', "TR4", ""),
             ('TR5', "TR5", ""),
-            ('TR5Main', "TR5Main", ""),
+            ('TEN', "Tomb Engine", ""),
         ),
         default='TR4',
     )
@@ -243,7 +243,7 @@ class ImportWAD(Operator, ImportHelper):
             ('TR3', "TR3", ""),
             ('TR4', "TR4", ""),
             ('TR5', "TR5", ""),
-            ('TR5Main', "TR5Main", ""),
+            ('TEN', "Tomb Engine", ""),
         ][::-1],
         default='OPT_SAMEASOBJECTS',
     )
@@ -537,6 +537,21 @@ class ImportWAD(Operator, ImportHelper):
             options.flip_normals = False
 
         wad = self._load_wad_file(options)
+
+        # Auto-detect game version from WAD2 SuggestedGameVersion chunk
+        if options.is_wad2 and hasattr(wad, 'version') and wad.version:
+            _VERSION_MAP = {1: 'TR1', 2: 'TR2', 3: 'TR3', 4: 'TR4',
+                            5: 'TR5', 16: 'TR4', 18: 'TEN'}  # TRNG(16) → TR4
+            detected = _VERSION_MAP.get(wad.version)
+            if detected and detected in ImportWADContext.mov_names:
+                self.game = detected
+                ImportWADContext.set_game(detected)
+                # Re-resolve name tables with the detected game
+                options.mov_names    = ImportWADContext.mov_names[detected]
+                options.static_names = ImportWADContext.static_names[detected]
+                options.state_names  = ImportWADContext.state_names[detected]
+                if self.anims_names_opt == 'OPT_SAMEASOBJECTS':
+                    options.anim_names = ImportWADContext.anim_names[detected]
 
         # Store wad on options so pack_wad2_textures can access texture data
         if options.is_wad2 and options.wad2_pack_textures:
