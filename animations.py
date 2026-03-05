@@ -76,8 +76,10 @@ def create_animations(item_idx, rig, bonenames, animations, options):
         action['frame_rate']             = animation.frameDuration
         action['next_animation']         = animation.nextAnimation
         action['next_frame']             = animation.frameIn
-        action['start_velocity']         = float(animation.speed)
-        action['end_velocity']           = float(animation.acceleration)
+        def _scalar(v):
+            return float(v) if isinstance(v, (int, float)) else 0.0
+        action['start_velocity']         = _scalar(animation.speed)
+        action['end_velocity']           = _scalar(animation.acceleration)
         action['start_lateral_velocity'] = 0.0
         action['end_lateral_velocity']   = 0.0
 
