@@ -395,6 +395,27 @@ def _extract_bones(rig, mesh_objects, scale):
 
 # ---------- Animation extraction ----------------------------------------------
 
+def _set_action_with_slot(rig, action):
+    """
+    Set the rig's active action AND the matching slot so Blender 5.0+
+    correctly evaluates the action's fcurves when frame_set is called.
+    Returns the slot that was set (or None).
+    """
+    rig.animation_data.action = action
+    slot = None
+    if hasattr(action, 'slots'):
+        for candidate in action.slots:
+            if (getattr(candidate, 'id_type', None) == 'OBJECT'
+                    and candidate.name == rig.name):
+                slot = candidate
+                break
+        if slot is None and len(action.slots) > 0:
+            slot = action.slots[0]
+    if slot is not None and hasattr(rig.animation_data, 'action_slot'):
+        rig.animation_data.action_slot = slot
+    return slot
+
+
 def _extract_animations(rig, mesh_objects, scale):
     """
     Extract all NLA-strip / active-action animations from an armature.
@@ -402,16 +423,15 @@ def _extract_animations(rig, mesh_objects, scale):
 
     Angles are stored as (pitch_deg, yaw_deg, roll_deg) in WAD space,
     matching WadKeyFrameRotation.Rotations (degrees).
+
+    Rotations are read from the EVALUATED pose bones (baked from NLA)
+    rather than raw fcurves, so Blender's full animation stack (slots,
+    NLA, constraints) is correctly reflected in the export.
     """
     if not rig or rig.type != 'ARMATURE' or not rig.animation_data:
         return []
 
-    # Reuse the working conversion helpers from the .anim exporter.
-    from .export_anim import (
-        AXIS_MAT, AXIS_MAT_T, _get_action_fcurves,
-        _build_curve_map, _evaluate_quat,
-        _mat_to_yaw_pitch_roll, _blender_to_wad_vec,
-    )
+    from .export_anim import AXIS_MAT, AXIS_MAT_T, _mat_to_yaw_pitch_roll, _blender_to_wad_vec
 
     # Collect unique actions from NLA tracks and active action
     actions = []
@@ -429,70 +449,87 @@ def _extract_animations(rig, mesh_objects, scale):
 
     bone_names = [m.name for m in mesh_objects]
     old_action = rig.animation_data.action
+    old_slot   = getattr(rig.animation_data, 'action_slot', None)
     old_frame  = bpy.context.scene.frame_current
 
+    # Mute all NLA tracks while exporting each action via the active-action
+    # slot, so the NLA strips don't interfere with (double-apply) the pose.
+    nla_mute_states = {}
+    if rig.animation_data.nla_tracks:
+        for track in rig.animation_data.nla_tracks:
+            nla_mute_states[track.name] = track.mute
+            track.mute = True
+
     animations = []
-    for action in actions:
-        rig.animation_data.action = action
+    try:
+        for action in actions:
+            # Set action + correct slot so Blender evaluates the right fcurves.
+            _set_action_with_slot(rig, action)
 
-        frame_start = int(action.frame_range[0])
-        frame_end   = int(action.frame_range[1])
+            frame_start = int(action.frame_range[0])
+            frame_end   = int(action.frame_range[1])
 
-        # Use the slot-aware fcurve getter (handles new Blender action API)
-        fcurves   = _get_action_fcurves(rig, action)
-        curve_map = _build_curve_map(fcurves)
+            # Collect the unique keyframe positions stored in the action.
+            # We iterate through the channelbag's fcurves to find them.
+            from bpy_extras import anim_utils as _anim_utils
+            slot = getattr(rig.animation_data, 'action_slot', None)
+            kf_frames_set = set()
+            if slot is not None and hasattr(action, 'slots'):
+                try:
+                    cb = _anim_utils.action_ensure_channelbag_for_slot(action, slot)
+                    for fc in cb.fcurves:
+                        for kp in fc.keyframe_points:
+                            f = int(kp.co[0])
+                            if frame_start <= f <= frame_end:
+                                kf_frames_set.add(f)
+                except Exception:
+                    pass
+            # Fall back to scanning all fcurves in the action (Blender 4.x)
+            if not kf_frames_set and hasattr(action, 'fcurves'):
+                for fc in action.fcurves:
+                    for kp in fc.keyframe_points:
+                        f = int(kp.co[0])
+                        if frame_start <= f <= frame_end:
+                            kf_frames_set.add(f)
+            kf_frames = sorted(kf_frames_set) if kf_frames_set else [frame_start]
 
-        # Gather unique keyframe positions from fcurves
-        kf_frames = sorted(set(
-            int(kp.co[0])
-            for fc in fcurves
-            for kp in fc.keyframe_points
-            if frame_start <= int(kp.co[0]) <= frame_end
-        ))
-        if not kf_frames:
-            kf_frames = [frame_start]
+            keyframes = []
+            for frame in kf_frames:
+                # Bake: evaluate the full animation stack at this frame.
+                bpy.context.scene.frame_set(frame)
+                bpy.context.view_layer.update()
 
-        keyframes = []
-        for frame in kf_frames:
-            bpy.context.scene.frame_set(frame)
-            bpy.context.view_layer.update()
+                # Root bone offset: read from evaluated pose bone location.
+                root_offset = (0.0, 0.0, 0.0)
+                if bone_names and bone_names[0] in rig.pose.bones:
+                    root_bone = rig.pose.bones[bone_names[0]]
+                    loc = [root_bone.location[i] * scale for i in range(3)]
+                    root_offset = _blender_to_wad_vec(loc)
 
-            # Root bone offset: Blender → WAD space
-            root_offset = (0.0, 0.0, 0.0)
-            if bone_names and bone_names[0] in rig.pose.bones:
-                root_loc_path = f'pose.bones["{bone_names[0]}"].location'
-                loc = [0.0, 0.0, 0.0]
-                for axis in range(3):
-                    fc = curve_map.get((root_loc_path, axis))
-                    if fc:
-                        loc[axis] = fc.evaluate(frame) * scale
-                root_offset = _blender_to_wad_vec(loc)
+                # Per-bone angles: read evaluated rotation_quaternion and
+                # convert to WAD (pitch_deg, yaw_deg, roll_deg).
+                angles = []
+                for bn in bone_names:
+                    if bn in rig.pose.bones:
+                        bone  = rig.pose.bones[bn]
+                        q     = bone.rotation_quaternion
+                        mat_b = q.to_matrix()
+                        mat_w = AXIS_MAT_T @ mat_b @ AXIS_MAT
+                        yaw, pitch, roll = _mat_to_yaw_pitch_roll(mat_w)
+                        angles.append((
+                            math.degrees(pitch),
+                            math.degrees(yaw),
+                            math.degrees(roll),
+                        ))
+                    else:
+                        angles.append((0.0, 0.0, 0.0))
 
-            # Per-bone angles: convert quaternion → WAD rotation matrix
-            # → extract yaw/pitch/roll in degrees (pitch, yaw, roll).
-            # Matches WadKeyFrameRotation.Rotations storage format.
-            angles = []
-            for bn in bone_names:
-                if bn in rig.pose.bones:
-                    bone = rig.pose.bones[bn]
-                    q      = _evaluate_quat(curve_map, bone, frame)
-                    mat_b  = q.to_matrix()
-                    mat_w  = AXIS_MAT_T @ mat_b @ AXIS_MAT
-                    yaw, pitch, roll = _mat_to_yaw_pitch_roll(mat_w)
-                    angles.append((
-                        math.degrees(pitch),
-                        math.degrees(yaw),
-                        math.degrees(roll),
-                    ))
-                else:
-                    angles.append((0.0, 0.0, 0.0))
-
-            keyframes.append({
-                'offset':  root_offset,
-                'bb_min':  (0.0, 0.0, 0.0),
-                'bb_max':  (0.0, 0.0, 0.0),
-                'angles':  angles,
-            })
+                keyframes.append({
+                    'offset':  root_offset,
+                    'bb_min':  (0.0, 0.0, 0.0),
+                    'bb_max':  (0.0, 0.0, 0.0),
+                    'angles':  angles,
+                })
 
         # Read optional custom properties from the action
         state_id   = int(action.get('state_id', 0))
@@ -536,9 +573,19 @@ def _extract_animations(rig, mesh_objects, scale):
             'end_lateral_velocity':    float(action.get('end_lateral_velocity', 0)),
         })
 
-    # Restore state
-    rig.animation_data.action = old_action
-    bpy.context.scene.frame_set(old_frame)
+    finally:
+        # Restore NLA mute states, active action, slot and frame.
+        if rig.animation_data.nla_tracks:
+            for track in rig.animation_data.nla_tracks:
+                if track.name in nla_mute_states:
+                    track.mute = nla_mute_states[track.name]
+        rig.animation_data.action = old_action
+        if old_slot is not None and hasattr(rig.animation_data, 'action_slot'):
+            try:
+                rig.animation_data.action_slot = old_slot
+            except Exception:
+                pass
+        bpy.context.scene.frame_set(old_frame)
 
     return animations
 

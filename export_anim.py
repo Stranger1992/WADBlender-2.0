@@ -177,14 +177,33 @@ def export_anim(filepath, rig_name, scale, frame_rate):
         raise ValueError("Selected armature has no active action.")
 
     action = rig.animation_data.action
-    fcurves = _get_action_fcurves(rig, action)
-    curve_map = _build_curve_map(fcurves)
+
+    # Set the correct action slot so Blender evaluates this action's fcurves
+    # when frame_set is called (Blender 5.0+ slot/channelbag API).
+    if hasattr(action, 'slots') and hasattr(rig.animation_data, 'action_slot'):
+        slot = None
+        for candidate in action.slots:
+            if (getattr(candidate, 'id_type', None) == 'OBJECT'
+                    and candidate.name == rig.name):
+                slot = candidate
+                break
+        if slot is None and len(action.slots) > 0:
+            slot = action.slots[0]
+        if slot is not None:
+            rig.animation_data.action_slot = slot
+
+    # Mute all NLA tracks so the active action isn't double-applied.
+    nla_mute_states = {}
+    if rig.animation_data.nla_tracks:
+        for track in rig.animation_data.nla_tracks:
+            nla_mute_states[track.name] = track.mute
+            track.mute = True
 
     bones = list(rig.pose.bones)
     if not bones:
         raise ValueError("Selected armature has no bones.")
 
-    root_bone = bones[0].name
+    root_bone_name = bones[0].name
 
     # frame_rate (UI prop) = sampling step in Blender frames.
     # xml_frame_rate = WAD frame duration stored as custom property (how many
@@ -215,46 +234,57 @@ def export_anim(filepath, rig_name, scale, frame_rate):
     _get_or_create(root, "StartLateralVelocity").text = str(float(action.get('start_lateral_velocity', 0)))
     _get_or_create(root, "EndLateralVelocity").text = str(float(action.get('end_lateral_velocity', 0)))
 
-    root_loc_path = f'pose.bones["{root_bone}"].location'
+    old_frame = bpy.context.scene.frame_current
+    try:
+        for frame in frames:
+            # Bake: evaluate full animation stack at this frame so NLA / slot
+            # effects are reflected in the pose bone values.
+            bpy.context.scene.frame_set(frame)
+            bpy.context.view_layer.update()
 
-    for frame in frames:
-        wadkf = ET.SubElement(keyframes_node, "WadKeyFrame")
+            wadkf = ET.SubElement(keyframes_node, "WadKeyFrame")
 
-        bbox = ET.SubElement(wadkf, "BoundingBox")
-        minimum = ET.SubElement(bbox, "Minimum")
-        ET.SubElement(minimum, "X").text = "0"
-        ET.SubElement(minimum, "Y").text = "0"
-        ET.SubElement(minimum, "Z").text = "0"
+            bbox = ET.SubElement(wadkf, "BoundingBox")
+            minimum = ET.SubElement(bbox, "Minimum")
+            ET.SubElement(minimum, "X").text = "0"
+            ET.SubElement(minimum, "Y").text = "0"
+            ET.SubElement(minimum, "Z").text = "0"
 
-        maximum = ET.SubElement(bbox, "Maximum")
-        ET.SubElement(maximum, "X").text = "0"
-        ET.SubElement(maximum, "Y").text = "0"
-        ET.SubElement(maximum, "Z").text = "0"
+            maximum = ET.SubElement(bbox, "Maximum")
+            ET.SubElement(maximum, "X").text = "0"
+            ET.SubElement(maximum, "Y").text = "0"
+            ET.SubElement(maximum, "Z").text = "0"
 
-        loc = [
-            _eval_curve(curve_map, root_loc_path, axis, frame, 0.0)
-            for axis in range(3)
-        ]
-        loc_scaled = (loc[0] * scale, loc[1] * scale, loc[2] * scale)
-        offset = _blender_to_wad_vec(loc_scaled)
+            # Root bone offset from evaluated pose (not raw fcurve).
+            root_pose_bone = rig.pose.bones[root_bone_name]
+            loc_scaled = tuple(root_pose_bone.location[i] * scale for i in range(3))
+            offset = _blender_to_wad_vec(loc_scaled)
 
-        offset_node = ET.SubElement(wadkf, "Offset")
-        ET.SubElement(offset_node, "X").text = "%.6f" % offset[0]
-        ET.SubElement(offset_node, "Y").text = "%.6f" % offset[1]
-        ET.SubElement(offset_node, "Z").text = "%.6f" % offset[2]
+            offset_node = ET.SubElement(wadkf, "Offset")
+            ET.SubElement(offset_node, "X").text = "%.6f" % offset[0]
+            ET.SubElement(offset_node, "Y").text = "%.6f" % offset[1]
+            ET.SubElement(offset_node, "Z").text = "%.6f" % offset[2]
 
-        angles_node = ET.SubElement(wadkf, "Angles")
-        for bone in bones:
-            quat = _evaluate_quat(curve_map, bone, frame)
-            mat_b = quat.to_matrix()
-            mat_w = AXIS_MAT_T @ mat_b @ AXIS_MAT
-            yaw, pitch, roll = _mat_to_yaw_pitch_roll(mat_w)
+            angles_node = ET.SubElement(wadkf, "Angles")
+            for bone in bones:
+                # Read rotation from the evaluated pose bone (baked from NLA).
+                quat  = bone.rotation_quaternion
+                mat_b = quat.to_matrix()
+                mat_w = AXIS_MAT_T @ mat_b @ AXIS_MAT
+                yaw, pitch, roll = _mat_to_yaw_pitch_roll(mat_w)
 
-            rot = ET.SubElement(angles_node, "WadKeyFrameRotation")
-            rot = ET.SubElement(rot, "Rotations")
-            ET.SubElement(rot, "X").text = "%.6f" % math.degrees(pitch)
-            ET.SubElement(rot, "Y").text = "%.6f" % math.degrees(yaw)
-            ET.SubElement(rot, "Z").text = "%.6f" % math.degrees(roll)
+                rot = ET.SubElement(angles_node, "WadKeyFrameRotation")
+                rot = ET.SubElement(rot, "Rotations")
+                ET.SubElement(rot, "X").text = "%.6f" % math.degrees(pitch)
+                ET.SubElement(rot, "Y").text = "%.6f" % math.degrees(yaw)
+                ET.SubElement(rot, "Z").text = "%.6f" % math.degrees(roll)
+    finally:
+        bpy.context.scene.frame_set(old_frame)
+        # Restore NLA mute states.
+        if rig.animation_data.nla_tracks:
+            for track in rig.animation_data.nla_tracks:
+                if track.name in nla_mute_states:
+                    track.mute = nla_mute_states[track.name]
 
     # Write StateChanges from custom property JSON.
     sc_node = root.find("StateChanges")
