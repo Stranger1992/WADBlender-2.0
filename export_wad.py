@@ -522,7 +522,7 @@ def _extract_animations(rig, mesh_objects, scale):
 
         animations.append({
             'state_id':                state_id,
-            'end_frame':               max(0, frame_end - frame_start),
+            'end_frame':               len(keyframes) * frame_rate,
             'frame_rate':              frame_rate,
             'next_animation':          next_anim,
             'next_frame':              next_frame,

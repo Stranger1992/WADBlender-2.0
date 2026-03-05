@@ -70,6 +70,47 @@ def create_animations(item_idx, rig, bonenames, animations, options):
 
         action.use_fake_user = True
 
+        # Store WAD animation metadata as custom properties so the exporter
+        # can round-trip them accurately.
+        action['state_id']               = animation.stateID
+        action['frame_rate']             = animation.frameDuration
+        action['next_animation']         = animation.nextAnimation
+        action['next_frame']             = animation.frameIn
+        action['start_velocity']         = float(animation.speed)
+        action['end_velocity']           = float(animation.acceleration)
+        action['start_lateral_velocity'] = 0.0
+        action['end_lateral_velocity']   = 0.0
+
+        # State changes: {state_id: [(in, out, next_anim, next_frame), ...]}
+        sc_list = []
+        for sc_id, dispatches in animation.stateChanges.items():
+            disp_list = []
+            for d in dispatches:
+                if isinstance(d, (list, tuple)) and len(d) >= 4:
+                    disp_list.append({
+                        'in_frame':      int(d[0]),
+                        'out_frame':     int(d[1]),
+                        'next_animation': int(d[2]),
+                        'next_frame':    int(d[3]),
+                    })
+                elif isinstance(d, dict):
+                    disp_list.append(d)
+            sc_list.append({'state_id': int(sc_id), 'dispatches': disp_list})
+        action['state_changes'] = json.dumps(sc_list)
+
+        # Anim commands: [(type, param1, param2, param3), ...]
+        cmd_list = []
+        for cmd in animation.commands:
+            if isinstance(cmd, (list, tuple)) and len(cmd) >= 4:
+                cmd_list.append({
+                    'type':   int(cmd[0]),
+                    'param1': int(cmd[1]),
+                    'param2': int(cmd[2]),
+                    'param3': int(cmd[3]),
+                })
+            elif isinstance(cmd, dict):
+                cmd_list.append(cmd)
+        action['anim_commands'] = json.dumps(cmd_list)
 
         track = rig.animation_data.nla_tracks.new()
         name = action.name
