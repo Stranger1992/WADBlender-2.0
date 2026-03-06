@@ -25,11 +25,11 @@ from .KeemapRetargetingAddon import (KeeMapBoneList, KeeMapBoneOperators,
 
 
 bl_info = {
-    "name": "WAD Blender",
-    "description": "Import Tomb Raider 4 Objects and animations into Blender",
-    "author": "JonnyvdS",
+    "name": "WAD Blender 2.0",
+    "description": "Import/Export Tomb Raider WAD and WAD2 files and animations into Blender",
+    "author": "JonnyvdS, Stranger1992",
     "version": (2, 0, 0),
-    "blender": (5, 0, 0),
+    "blender": (5, 0, 1),
     "location": "import.wad",
     "warning": "This addon is still in development.",
     "wiki_url": "",
