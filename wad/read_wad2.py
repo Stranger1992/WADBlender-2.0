@@ -1332,7 +1332,8 @@ class Wad2Loader:
             mapheight=mapheight,
             textureMap=texture_map,
             movables=movables_model,
-            textureMaps=textureMaps
+            textureMaps=textureMaps,
+            game_version=self.version if self.version < 130 else 0,
         )
 
     def _decode_texture_data(self, texture: dict, mapwidth: int, mapheight: int) -> List[float]:

@@ -80,3 +80,4 @@ class Wad:
     textureMap: List[float]
     movables: List[Movable]
     textureMaps: List[List[float]]
+    game_version: int = 0  # WAD2 SuggestedGameVersion (1=TR1..18=TombEngine)

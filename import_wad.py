@@ -18,6 +18,41 @@ WAD_EXTENSIONS = {'.wad', '.WAD'}
 WAD2_EXTENSIONS = {'.wad2', '.WAD2'}
 
 
+_WAD2_VERSION_MAP = {1: 'TR1', 2: 'TR2', 3: 'TR3', 4: 'TR4',
+                     5: 'TR5', 16: 'TR4', 18: 'TEN'}  # TRNG(16) → TR4
+
+
+def _detect_wad2_game(filepath):
+    """Quickly scan a WAD2 file for its SuggestedGameVersion chunk.
+    Returns a game key string (e.g. 'TEN') or None if not found."""
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read(8192)
+        marker = b'W2SuggestedGameVersion'
+        pos = data.find(marker)
+        if pos < 0:
+            return None
+        idx = pos + len(marker)
+        # Read LEB128 chunk size (skip it)
+        while idx < len(data) and (data[idx] & 0x80):
+            idx += 1
+        idx += 1  # last byte of size
+        # Read LEB128 signed version value
+        version = 0
+        shift = 0
+        while idx < len(data):
+            b = data[idx]; idx += 1
+            version |= (b & 0x7F) << shift
+            shift += 7
+            if not (b & 0x80):
+                if b & 0x40:  # sign-extend
+                    version -= (1 << shift)
+                break
+        return _WAD2_VERSION_MAP.get(version)
+    except Exception:
+        return None
+
+
 def check_requirements():
     try:
         import numpy
@@ -57,6 +92,7 @@ class ImportWADContext:
 
 
     game = 'TR4'
+    last_version_file = ''   # filepath of last WAD2 whose version was auto-detected
 
     @classmethod
     def set_game(cls, game):
@@ -249,6 +285,16 @@ class ImportWAD(Operator, ImportHelper):
     )
 
     def draw(self, context):
+        # Auto-detect game version from WAD2 when filepath changes
+        if (self.filepath and self.filepath.lower().endswith('.wad2')
+                and self.filepath != ImportWADContext.last_version_file
+                and os.path.isfile(self.filepath)):
+            ImportWADContext.last_version_file = self.filepath
+            detected = _detect_wad2_game(self.filepath)
+            if detected and detected in ImportWADContext.mov_names:
+                self.game = detected
+                ImportWADContext.set_game(detected)
+
         layout = self.layout
         row = layout.row()
         row.label(text='WAD Blender', icon="BLENDER")
@@ -306,7 +352,11 @@ class ImportWAD(Operator, ImportHelper):
 
         row = box.split(factor=0.5, align=True)
         row.label(text="Game Slot Names")
-        row.prop(self, "game", text="")
+        if self.filepath.lower().endswith('.wad2'):
+            # Read-only for WAD2: game version is fixed by the file
+            row.label(text=self.game)
+        else:
+            row.prop(self, "game", text="")
         ImportWADContext.set_game(self.game)
 
         row = box.row()
@@ -539,10 +589,8 @@ class ImportWAD(Operator, ImportHelper):
         wad = self._load_wad_file(options)
 
         # Auto-detect game version from WAD2 SuggestedGameVersion chunk
-        if options.is_wad2 and hasattr(wad, 'version') and wad.version:
-            _VERSION_MAP = {1: 'TR1', 2: 'TR2', 3: 'TR3', 4: 'TR4',
-                            5: 'TR5', 16: 'TR4', 18: 'TEN'}  # TRNG(16) → TR4
-            detected = _VERSION_MAP.get(wad.version)
+        if options.is_wad2 and getattr(wad, 'game_version', 0):
+            detected = _WAD2_VERSION_MAP.get(wad.game_version)
             if detected and detected in ImportWADContext.mov_names:
                 self.game = detected
                 ImportWADContext.set_game(detected)
@@ -560,8 +608,9 @@ class ImportWAD(Operator, ImportHelper):
         materials = self._setup_materials(context, wad, options)
         self._import_objects(context, materials, wad, options)
 
-        # Store the import path for later export
+        # Store the import path and detected game version for later export
         context.scene.wad_import_path = options.filepath
+        context.scene.wad_game = self.game
 
         ImportWADContext.last_selected_file = 'None'
         ImportWADContext.last_objects_list.clear()
@@ -669,10 +718,19 @@ def register():
     bpy.utils.register_class(ImportWAD)
     bpy.utils.register_class(PopUpSearch)
     bpy.utils.register_class(InstallRequirements)
+    bpy.types.Scene.wad_game = bpy.props.StringProperty(
+        name="WAD Game Version",
+        description="Game version detected from the last imported WAD2",
+        default=""
+    )
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.utils.unregister_class(ImportWAD)
     bpy.utils.unregister_class(PopUpSearch)
+    try:
+        del bpy.types.Scene.wad_game
+    except Exception:
+        pass
     bpy.utils.unregister_class(InstallRequirements)

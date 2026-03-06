@@ -299,94 +299,79 @@ def _add_polygon(out, shape, indices, uvs, shine, tex_idx,
 
 def _extract_bones(rig, mesh_objects, scale):
     """
-    Build the WAD2 Bone2 list from an armature.
+    Build the WAD2 bone list from an armature.
 
     Returns list of dicts: {op, name, translation, mesh_index}.
-    OpCodes:  0 = Push, 1 = Pop, 2 = Read/Peek, 3 = NotUseStack (simple chain)
-    C# enum WadLinkOpcode: Push=0, Pop=1, Read=2, NotUseStack=3
+    Pivot positions are read from bone.head_local (armature REST pose),
+    which is set during import to cpivot_points[mesh_name].
+    Blender→WAD2: inverse of _fix_axis_vec3(-x,-z,y) → (-dbx, dbz, -dby) * scale.
     """
     bones = []
 
+    def _to_wad(dbx, dby, dbz):
+        return (-dbx * scale, dbz * scale, -dby * scale)
+
     if not rig or rig.type != 'ARMATURE':
-        # No armature → simple linear chain (all NotUseStack)
+        # No armature — fall back to mesh object locations
         for i, obj in enumerate(mesh_objects):
-            bone_name = 'bone_0_root' if i == 0 else f'bone_{i}'
             if i == 0:
-                bones.append({'op': 0, 'name': bone_name,
+                bones.append({'op': 0, 'name': obj.name,
                               'translation': (0.0, 0.0, 0.0), 'mesh_index': 0})
             else:
                 prev = mesh_objects[i - 1]
-                # Blender→WAD2: inverse of _fix_axis_vec3 = (-Δbx, Δbz, -Δby)
-                dbx = obj.location.x - prev.location.x
-                dby = obj.location.y - prev.location.y
-                dbz = obj.location.z - prev.location.z
-                bones.append({'op': 0, 'name': bone_name,
-                              'translation': (-dbx * scale, dbz * scale, -dby * scale),
-                              'mesh_index': i})
+                t = _to_wad(obj.location.x - prev.location.x,
+                            obj.location.y - prev.location.y,
+                            obj.location.z - prev.location.z)
+                bones.append({'op': 0, 'name': obj.name,
+                              'translation': t, 'mesh_index': i})
         return bones
 
-    # Build a mapping: mesh_name → armature bone
+    # Read pivot positions from armature REST pose.
+    # bone.head_local is the bone head in armature local space — set during import
+    # via bone.head = cpivot_points[cur] in edit mode.
     arm_bones = rig.data.bones
     name_lookup = {b.name: b for b in arm_bones}
 
     for i, mesh_obj in enumerate(mesh_objects):
-        bone = name_lookup.get(mesh_obj.name)
+        arm_bone = name_lookup.get(mesh_obj.name)
 
         if i == 0:
-            # Root — always Push, zero translation
             bones.append({
                 'op':          0,
-                'name':        'bone_0_root',
+                'name':        mesh_obj.name,
                 'translation': (0.0, 0.0, 0.0),
                 'mesh_index':  0,
             })
             continue
 
-        # Translation relative to parent mesh
-        if bone and bone.parent:
-            parent_name = bone.parent.name
-            parent_mesh = next((m for m in mesh_objects if m.name == parent_name), None)
-            if parent_mesh:
-                dbx = mesh_obj.location.x - parent_mesh.location.x
-                dby = mesh_obj.location.y - parent_mesh.location.y
-                dbz = mesh_obj.location.z - parent_mesh.location.z
+        if arm_bone:
+            head = arm_bone.head_local
+            if arm_bone.parent:
+                ph = arm_bone.parent.head_local
+                dbx = head.x - ph.x
+                dby = head.y - ph.y
+                dbz = head.z - ph.z
             else:
-                dbx = mesh_obj.location.x
-                dby = mesh_obj.location.y
-                dbz = mesh_obj.location.z
-            # Blender→WAD2: inverse of _fix_axis_vec3 = (-Δbx, Δbz, -Δby)
-            dx = -dbx * scale
-            dy =  dbz * scale
-            dz = -dby * scale
+                dbx, dby, dbz = head.x, head.y, head.z
 
-            # Determine stack opcode from sibling structure
-            siblings = list(bone.parent.children)
+            siblings = list(arm_bone.parent.children) if arm_bone.parent else []
             if len(siblings) <= 1:
-                op = 0    # NotUseStack — single child
+                op = 0
             else:
-                idx_in_siblings = siblings.index(bone)
-                if idx_in_siblings == 0:
-                    op = 2   # Push
-                elif idx_in_siblings == len(siblings) - 1:
-                    op = 1   # Pop
-                else:
-                    op = 3   # Read (peek)
+                idx = siblings.index(arm_bone)
+                op = 2 if idx == 0 else (1 if idx == len(siblings) - 1 else 3)
         else:
-            # Orphan bone or no parent info — chain
+            # Bone not in armature — delta from previous mesh object
             prev = mesh_objects[i - 1]
             dbx = mesh_obj.location.x - prev.location.x
             dby = mesh_obj.location.y - prev.location.y
             dbz = mesh_obj.location.z - prev.location.z
-            # Blender→WAD2: inverse of _fix_axis_vec3 = (-Δbx, Δbz, -Δby)
-            dx = -dbx * scale
-            dy =  dbz * scale
-            dz = -dby * scale
             op = 0
 
         bones.append({
             'op':          op,
-            'name':        f'bone_{i}',
-            'translation': (dx, dy, dz),
+            'name':        mesh_obj.name,
+            'translation': _to_wad(dbx, dby, dbz),
             'mesh_index':  i,
         })
 
@@ -662,16 +647,33 @@ def export_wad2(context, filepath, scale, game, export_anims=True):
             rig = next((o for o in col.objects if o.type == 'ARMATURE'), None)
             mov_id = _resolve_slot_id(col, name_to_id)
 
-            meshes = []
-            for mobj in mesh_objects:
-                md = _extract_mesh(mobj, textures, img_to_idx, scale)
-                meshes.append(md)
+            # Switch to REST position so mesh vertices and bone pivots are read
+            # from the undeformed rest pose, then restore for animation extraction.
+            saved_pose_pos = rig.data.pose_position if rig else None
+            try:
+                if rig and saved_pose_pos != 'REST':
+                    rig.data.pose_position = 'REST'
+                    bpy.context.view_layer.update()
 
-            bones = _extract_bones(rig, mesh_objects, scale)
+                meshes = []
+                for mobj in mesh_objects:
+                    md = _extract_mesh(mobj, textures, img_to_idx, scale)
+                    meshes.append(md)
 
-            animations = []
-            if export_anims:
-                animations = _extract_animations(rig, mesh_objects, scale)
+                bones = _extract_bones(rig, mesh_objects, scale)
+
+                # Restore POSE position before animation extraction so that
+                # frame_set() evaluates the actual animated bone transforms.
+                if rig and saved_pose_pos is not None and saved_pose_pos != 'REST':
+                    rig.data.pose_position = saved_pose_pos
+                    bpy.context.view_layer.update()
+
+                animations = []
+                if export_anims:
+                    animations = _extract_animations(rig, mesh_objects, scale)
+            finally:
+                if rig and saved_pose_pos is not None:
+                    rig.data.pose_position = saved_pose_pos
 
             if not animations:
                 # WadTool requires at least one animation with one keyframe to
@@ -1025,6 +1027,8 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
             if self.import_path.lower().endswith('.wad2'):
                 self.export_format = 'WAD2'
                 self.filename_ext = '.wad2'
+        if hasattr(context.scene, 'wad_game') and context.scene.wad_game:
+            self.game = context.scene.wad_game
         return super().invoke(context, event)
 
     def draw(self, context):
@@ -1046,7 +1050,15 @@ class ExportWAD(bpy.types.Operator, ExportHelper):
 
         box.separator()
         box.prop(self, "scale")
-        box.prop(self, "game")
+
+        _game_labels = {
+            'TR1': 'TR1', 'TR2': 'TR2', 'TR3': 'TR3', 'TR4': 'TR4 / TRLE',
+            'TRNG': 'TRNG', 'TR5': 'TR5', 'TEN': 'Tomb Engine',
+        }
+        game_display = _game_labels.get(self.game, self.game) or 'Unknown'
+        row = box.split(factor=0.4, align=True)
+        row.label(text="Game")
+        row.label(text=game_display, icon="INFO")
 
 
 def menu_func_export(self, context):
