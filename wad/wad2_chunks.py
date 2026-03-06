@@ -188,5 +188,6 @@ class ChunkId:
     BBox = b'W2BBox'  # Bounding box
     StCh = b'W2StCh'  # State change (compact)
     Disp = b'W2Disp'  # Dispatch (compact)
-    Cmd2 = b'W2Cmd2'  # Command (compact)
+    Cmd = b'W2Cmd'    # Command (legacy compact) — TombLib AnimCommand
+    Cmd2 = b'W2Cmd2'  # Command (compact) — TombLib AnimCommand2
     CmdSnd = b'W2CmdSnd'  # Sound command (compact)

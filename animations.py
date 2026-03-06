@@ -127,14 +127,17 @@ def create_animations(item_idx, rig, bonenames, animations, options):
         action['state_changes'] = json.dumps(sc_list)
 
         # Anim commands: [(type, param1, param2, param3), ...]
+        # Classic WAD commands have variable lengths (e.g. PlaySound is 3 elements);
+        # pad to 4 elements with zeros rather than silently dropping them.
         cmd_list = []
         for cmd in animation.commands:
-            if isinstance(cmd, (list, tuple)) and len(cmd) >= 4:
+            if isinstance(cmd, (list, tuple)) and len(cmd) >= 1:
+                padded = list(cmd) + [0, 0, 0]
                 cmd_list.append({
-                    'type':   int(cmd[0]),
-                    'param1': int(cmd[1]),
-                    'param2': int(cmd[2]),
-                    'param3': int(cmd[3]),
+                    'type':   int(padded[0]),
+                    'param1': int(padded[1]),
+                    'param2': int(padded[2]),
+                    'param3': int(padded[3]),
                 })
             elif isinstance(cmd, dict):
                 cmd_list.append(cmd)

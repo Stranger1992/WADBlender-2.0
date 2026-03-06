@@ -970,6 +970,10 @@ class Wad2Loader:
                 animation['frame_duration'] = read_leb128_uint(stream)
             elif sub_id == wad2_chunks.ChunkId.AnimationKeyFrames:
                 animation['keyframes'] = self.read_keyframes(reader, stream)
+            elif sub_id in (wad2_chunks.ChunkId.Cmd, wad2_chunks.ChunkId.Cmd2):
+                command = self.read_anim_command_compact(reader, stream)
+                if command:
+                    animation['commands'].append(command)
 
             reader.read_chunk_end()
 
@@ -1037,7 +1041,7 @@ class Wad2Loader:
                 state_id, dispatches = self.read_state_change_compact(reader, stream)
                 if state_id is not None:
                     animation['state_changes'][state_id] = dispatches
-            elif sub_id == wad2_chunks.ChunkId.Cmd2:
+            elif sub_id in (wad2_chunks.ChunkId.Cmd, wad2_chunks.ChunkId.Cmd2):
                 command = self.read_anim_command_compact(reader, stream)
                 if command:
                     animation['commands'].append(command)
