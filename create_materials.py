@@ -100,6 +100,36 @@ def _load_image_safe(filepath):
         print(f"[WAD Import] Could not load texture {filepath}: {e} (continuing without this map)")
         return None
 
+
+def _is_uv_mapped_mesh(mesh):
+    cached = getattr(mesh, "_cached_uv_mapped", None)
+    if isinstance(cached, bool):
+        return cached
+    mesh_uv_mapped = False
+    polygons = getattr(mesh, "polygons", [])
+    if polygons and any(hasattr(p, "uv_mapped") for p in polygons):
+        for polygon in polygons:
+            if getattr(polygon, 'uv_mapped', False):
+                mesh_uv_mapped = True
+                break
+    else:
+        # Fallback for Blender mesh data: rely on a cached flag if present.
+        mesh_uv_mapped = bool(getattr(mesh, "_wad_uv_mapped", False))
+    setattr(mesh, "_cached_uv_mapped", mesh_uv_mapped)
+    return mesh_uv_mapped
+
+
+def _get_alpha_socket(node):
+    if not node:
+        return None
+    try:
+        sock = node.outputs.get("Alpha") if hasattr(node.outputs, "get") else None
+        if sock is None:
+            sock = node.outputs["Alpha"]
+        return sock
+    except (KeyError, TypeError, AttributeError):
+        return None
+
 def _set_material_blend_mode(mat, mode):
     """Set material transparency mode compatible with Blender 4.2+ and older.
     
@@ -216,12 +246,9 @@ def generateNodesSetup(name, uvmap, extra_texture_dirs=None):
     # Links
     color_source = tex_diffuse if tex_diffuse else tex_base
     links.new(color_source.outputs["Color"], bsdf.inputs["Base Color"])
-    alpha_output = None
-    for source in (color_source, tex_base):
-        if source and "Alpha" in source.outputs:
-            alpha_output = source.outputs["Alpha"]
-            break
-    # Prefer alpha from the chosen color source; fall back to baked atlas alpha.
+    alpha_sources = [s for s in (color_source, tex_base) if s]
+    alpha_output = next((sock for sock in (_get_alpha_socket(src) for src in alpha_sources) if sock), None)
+    # Alpha priority: first available among the chosen color source(s); if none are present, default to fully opaque.
     if alpha_output:
         links.new(alpha_output, bsdf.inputs["Alpha"])
     else:
@@ -401,7 +428,10 @@ def pack_textures(context, meshes, objects, options, name):
         uv_layer = bm.loops.layers.uv.verify()
         roughness_layer = bm.loops.layers.color.new("shine")
         opacity_layer = bm.loops.layers.color.new("opacity")
-        sprytile.verify_bmesh_layers(bm)
+        mesh_uv_mapped = _is_uv_mapped_mesh(mesh)
+        setattr(obj.data, "_wad_uv_mapped", mesh_uv_mapped)
+        if not mesh_uv_mapped:
+            sprytile.verify_bmesh_layers(bm)
         for face_idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
             a, b, c, d = polygon.tbox
 
@@ -434,7 +464,7 @@ def pack_textures(context, meshes, objects, options, name):
             setUV(face, polygon, uvrect, uv_layer)
             setShineOpacity(obj, face, polygon, roughness_layer, opacity_layer)
 
-            if sprytile_installed:
+            if sprytile_installed and not mesh_uv_mapped:
                 sprytile.write_metadata(
                     context, obj, face_idx, bm, 
                     polygon.tex_width, polygon.tex_height, 
@@ -574,7 +604,9 @@ def pack_wad2_textures(context, meshes, objects, options, wad, name=''):
         uv_layer = bm.loops.layers.uv.verify()
         roughness_layer = bm.loops.layers.color.new("shine")
         opacity_layer = bm.loops.layers.color.new("opacity")
-        sprytile.verify_bmesh_layers(bm)
+        mesh_uv_mapped = _is_uv_mapped_mesh(mesh)
+        if not mesh_uv_mapped:
+            sprytile.verify_bmesh_layers(bm)
 
         for poly_idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
             # Assign material based on blend mode
@@ -612,7 +644,10 @@ def apply_textures(context, mesh, obj, materials, options, name=''):
     uv_layer = bm.loops.layers.uv.verify()
     roughness_layer = bm.loops.layers.color.new("shine")
     opacity_layer = bm.loops.layers.color.new("opacity")
-    sprytile.verify_bmesh_layers(bm)
+    mesh_uv_mapped = _is_uv_mapped_mesh(mesh)
+    setattr(obj.data, "_wad_uv_mapped", mesh_uv_mapped)
+    if not mesh_uv_mapped:
+        sprytile.verify_bmesh_layers(bm)
     for idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
         tile = min(polygon.tbox)
         tile_x, tile_y = tile
@@ -624,7 +659,7 @@ def apply_textures(context, mesh, obj, materials, options, name=''):
         setUV(face, polygon, polygon.tbox, uv_layer)
         setShineOpacity(obj, face, polygon, roughness_layer, opacity_layer)
 
-        if sprytile_installed and options.texture_pages:
+        if sprytile_installed and options.texture_pages and not mesh_uv_mapped:
             sprytile.write_metadata(
                 context, obj, idx, bm, 
                 polygon.tex_width, polygon.tex_height, 

@@ -1491,8 +1491,14 @@ class Wad2Loader:
         if len(uvs) < vertex_count:
             uvs = uvs + [(0.0, 0.0)] * (vertex_count - len(uvs))
         tbox = []
+        # Heuristic (on raw pixel coords): detect "UV mapped" if any UV deviates from whole-pixel tile corners before normalization.
+        uv_mapped = False
         for i in range(vertex_count):
             u, v = uvs[i]
+            if not uv_mapped:
+                # Treat as UV mapped if fractional component beyond 1e-4 when expressed in pixels.
+                if abs(u - round(u)) > 1e-4 or abs(v - round(v)) > 1e-4:
+                    uv_mapped = True
             if tex_w > 0 and tex_h > 0:
                 u = max(0.0, min(1.0, u / tex_w))
                 v = max(0.0, min(1.0, v / tex_h))
@@ -1524,7 +1530,8 @@ class Wad2Loader:
             flipY=False,
             origin=0,
             x=x,
-            y=y
+            y=y,
+            uv_mapped=uv_mapped
         )
         poly.texture_index = texture_idx
         poly.texture_flipped = 1 if poly_data.get('flipped', False) else 0
