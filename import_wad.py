@@ -415,6 +415,11 @@ class ImportWAD(Operator, ImportHelper):
 
         # Set texture options
         if is_wad2:
+            # TombEngine supports native UV-mapped models; avoid repacking by default
+            if ImportWADContext.game == 'TEN' and self.texture_type_wad2 == 'OPT_PACKED':
+                print("[WAD2 Options] TombEngine detected; defaulting to Texture Pages (no packing).")
+                self.texture_type_wad2 = 'OPT_PAGES'
+
             # Check numpy availability at runtime (the class-level check
             # can be stale if libraries were installed after addon load).
             # PIL is optional - we fall back to Blender's image API if missing.

@@ -1,5 +1,5 @@
 # WAD Blender
-Add-on to import Tomb Raider Level Editor objects and animations into Blender and export them into Tomb Editor or Unity. See [doc/FEATURES.md](doc/FEATURES.md) for a complete feature overview.
+Add-on to import Tomb Raider Level Editor objects and animations into Blender and export them into Tomb Editor or Unity. See [doc/FEATURES.md](doc/FEATURES.md) for a complete feature overview (including TombEngine notes).
 
 ## Download and Install
 * Click on the green Code button and download zip;

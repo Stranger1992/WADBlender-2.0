@@ -45,4 +45,5 @@ This add-on focuses on moving Tomb Raider WAD/WAD2 content between the TRLE tool
 - Add-on is still under active development.
 - Importing multiple WADs into one .blend can create name conflicts (duplicate object/collection names or texture page reuse). As a workaround, import into separate files, or prefix/rename imported collections and texture pages before bringing in a second WAD.
 - Importing and Mixamo retargeting currently require the main armature to be named exactly `LARA_RIG`; custom naming is not supported yet.
+- TombEngine: prefer texture pages (skip packing) to preserve original UV mapping; auto-packing can alter UVs. PBR-style maps (specular/emission/roughness/diffuse slots) are not yet imported or generated—materials are basic Principled BSDF with base/emission only.
 - FBX export may require adjusting NLA strips.
