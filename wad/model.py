@@ -22,6 +22,7 @@ class Polygon:
     origin: int
     x: int
     y: int
+    uv_mapped: bool = False
 
 
 @dataclass

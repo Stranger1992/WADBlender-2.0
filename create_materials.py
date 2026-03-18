@@ -1,10 +1,134 @@
 from os import path
 from math import floor
+import xml.etree.ElementTree as ET
 
 import bpy
 import bmesh
 
 from . import sprytile_utils as sprytile
+
+_PBR_SUFFIXES = {
+    "diffuse": ["_diffuse", "_albedo", "_base_color"],
+    "emission": ["_emission", "_emit", "_emissive"],
+    "roughness": ["_roughness", "_rough"],
+    "specular": ["_specular", "_spec"],
+}
+
+_PBR_EXTS = [".png", ".tga", ".tif", ".tiff", ".jpg", ".jpeg", ".dds"]
+
+
+def _load_material_xml(base_stem, search_dirs):
+    """Parse sidecar MaterialData XML for map filenames, if present."""
+    for d in search_dirs:
+        if not d:
+            continue
+        xml_path = path.join(d, f"{base_stem}.xml")
+        if not path.exists(xml_path):
+            continue
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+        except Exception as e:
+            print(f"[WAD Import] Could not read material XML {xml_path}: {e} (continuing)")
+            continue
+
+        def _get(tag):
+            el = root.find(tag)
+            if el is not None and el.text:
+                return el.text.strip()
+            return None
+
+        mapping = {
+            "diffuse": _get("ColorMap"),
+            "emission": _get("EmissiveMap"),
+            "specular": _get("SpecularMap"),
+            "roughness": _get("RoughnessMap"),
+        }
+
+        resolved = {}
+        for kind, filename in mapping.items():
+            if not filename:
+                continue
+            candidate = filename if path.isabs(filename) else path.join(d, filename)
+            if path.exists(candidate):
+                resolved[kind] = candidate
+        if resolved:
+            return resolved
+    return {}
+
+
+def _find_pbr_textures(base_image_path, extra_dirs=None):
+    """Return dict of optional PBR texture paths found near base image.
+
+    Looks for common suffixes next to the baked texture (temp directory)
+    and in any additional directories (e.g., original WAD folder).
+    """
+    base_stem = path.splitext(path.basename(base_image_path))[0]
+    search_dirs = [path.dirname(base_image_path)]
+    if extra_dirs:
+        search_dirs.extend(extra_dirs)
+    # Deduplicate while preserving order
+    unique_dirs = []
+    for d in search_dirs:
+        if d and d not in unique_dirs:
+            unique_dirs.append(d)
+
+    # 1) Try sidecar MaterialData XML first (supports Tomb Editor / WadTool)
+    found = _load_material_xml(base_stem, unique_dirs)
+
+    # 2) Fall back to suffix-based discovery
+    for kind, suffixes in _PBR_SUFFIXES.items():
+        if kind in found:
+            continue
+        candidates = []
+        for d in unique_dirs:
+            for suf in suffixes:
+                for ext in _PBR_EXTS:
+                    candidates.append(path.join(d, base_stem + suf + ext))
+        for candidate in candidates:
+            if path.exists(candidate):
+                found[kind] = candidate
+                break
+
+    return found
+
+
+def _load_image_safe(filepath):
+    try:
+        return bpy.data.images.load(filepath)
+    except Exception as e:
+        print(f"[WAD Import] Could not load texture {filepath}: {e} (continuing without this map)")
+        return None
+
+
+def _is_uv_mapped_mesh(mesh):
+    cached = getattr(mesh, "_cached_uv_mapped", None)
+    if isinstance(cached, bool):
+        return cached
+    mesh_uv_mapped = False
+    polygons = getattr(mesh, "polygons", [])
+    if polygons and any(hasattr(p, "uv_mapped") for p in polygons):
+        for polygon in polygons:
+            if getattr(polygon, 'uv_mapped', False):
+                mesh_uv_mapped = True
+                break
+    else:
+        # Fallback for Blender mesh data: rely on a cached flag if present.
+        mesh_uv_mapped = bool(getattr(mesh, "_wad_uv_mapped", False))
+    setattr(mesh, "_cached_uv_mapped", mesh_uv_mapped)
+    return mesh_uv_mapped
+
+
+def _get_alpha_socket(node):
+    if not node:
+        return None
+    try:
+        sock = node.outputs.get("Alpha") if hasattr(node.outputs, "get") else None
+        if sock is None:
+            sock = node.outputs["Alpha"]
+        return sock
+    except (KeyError, TypeError, AttributeError):
+        return None
 
 def _set_material_blend_mode(mat, mode):
     """Set material transparency mode compatible with Blender 4.2+ and older.
@@ -24,7 +148,7 @@ def _set_material_blend_mode(mat, mode):
             mat.alpha_threshold = 0.5
 
 
-def generateNodesSetup(name, uvmap):
+def generateNodesSetup(name, uvmap, extra_texture_dirs=None):
     # Reuse existing material if present
     if name in bpy.data.materials:
         return bpy.data.materials[name]
@@ -36,8 +160,13 @@ def generateNodesSetup(name, uvmap):
     # Transparency settings
     _set_material_blend_mode(mat, 'CLIP')
 
-    # Load texture
-    img = bpy.data.images.load(uvmap)
+    # Load texture(s)
+    base_img = _load_image_safe(uvmap)
+    if base_img is None:
+        # Fallback to empty material if load fails
+        return mat
+
+    pbr_maps = _find_pbr_textures(uvmap, extra_texture_dirs)
 
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
@@ -45,15 +174,66 @@ def generateNodesSetup(name, uvmap):
 
     # Base texture
     tex_base = nodes.new("ShaderNodeTexImage")
-    tex_base.image = img
+    tex_base.image = base_img
     tex_base.interpolation = 'Closest'
-    tex_base.location = (-600, 100)
+    tex_base.location = (-600, 150)
 
-    # Emission texture (duplicate)
-    tex_emit = nodes.new("ShaderNodeTexImage")
-    tex_emit.image = img
-    tex_emit.interpolation = 'Closest'
-    tex_emit.location = (-600, -100)
+    # Diffuse override (if provided)
+    tex_diffuse = None
+    if "diffuse" in pbr_maps:
+        tex_diffuse = nodes.new("ShaderNodeTexImage")
+        tex_diffuse.image = _load_image_safe(pbr_maps["diffuse"])
+        if tex_diffuse.image:
+            tex_diffuse.interpolation = 'Closest'
+            tex_diffuse.location = (-900, 150)
+        else:
+            nodes.remove(tex_diffuse)
+            tex_diffuse = None
+
+    # Emission texture (duplicate or dedicated)
+    tex_emit = None
+    if "emission" in pbr_maps:
+        tex_emit = nodes.new("ShaderNodeTexImage")
+        tex_emit.image = _load_image_safe(pbr_maps["emission"])
+        if tex_emit.image:
+            tex_emit.interpolation = 'Closest'
+            tex_emit.location = (-900, -50)
+        else:
+            nodes.remove(tex_emit)
+            tex_emit = None
+    if tex_emit is None:
+        tex_emit = nodes.new("ShaderNodeTexImage")
+        tex_emit.image = base_img
+        tex_emit.interpolation = 'Closest'
+        tex_emit.location = (-600, -50)
+
+    # Roughness
+    tex_rough = None
+    if "roughness" in pbr_maps:
+        tex_rough = nodes.new("ShaderNodeTexImage")
+        tex_rough.image = _load_image_safe(pbr_maps["roughness"])
+        if tex_rough.image:
+            tex_rough.interpolation = 'Closest'
+            tex_rough.location = (-900, -250)
+            if hasattr(tex_rough.image, "colorspace_settings"):
+                tex_rough.image.colorspace_settings.name = 'Non-Color'
+        else:
+            nodes.remove(tex_rough)
+            tex_rough = None
+
+    # Specular
+    tex_spec = None
+    if "specular" in pbr_maps:
+        tex_spec = nodes.new("ShaderNodeTexImage")
+        tex_spec.image = _load_image_safe(pbr_maps["specular"])
+        if tex_spec.image:
+            tex_spec.interpolation = 'Closest'
+            tex_spec.location = (-900, -450)
+            if hasattr(tex_spec.image, "colorspace_settings"):
+                tex_spec.image.colorspace_settings.name = 'Non-Color'
+        else:
+            nodes.remove(tex_spec)
+            tex_spec = None
 
     # Principled BSDF
     bsdf = nodes.new("ShaderNodeBsdfPrincipled")
@@ -64,11 +244,24 @@ def generateNodesSetup(name, uvmap):
     out.location = (200, 0)
 
     # Links
-    links.new(tex_base.outputs["Color"], bsdf.inputs["Base Color"])
-    links.new(tex_base.outputs["Alpha"], bsdf.inputs["Alpha"])
+    color_source = tex_diffuse if tex_diffuse else tex_base
+    links.new(color_source.outputs["Color"], bsdf.inputs["Base Color"])
+    alpha_sources = [s for s in (color_source, tex_base) if s]
+    alpha_output = next((sock for sock in (_get_alpha_socket(src) for src in alpha_sources) if sock), None)
+    # Alpha priority: first available among the chosen color source(s); if none are present, default to fully opaque.
+    if alpha_output:
+        links.new(alpha_output, bsdf.inputs["Alpha"])
+    else:
+        bsdf.inputs["Alpha"].default_value = 1.0
 
     links.new(tex_emit.outputs["Color"], bsdf.inputs["Emission Color"])
     bsdf.inputs["Emission Strength"].default_value = 1.0
+
+    if tex_rough and tex_rough.image:
+        links.new(tex_rough.outputs["Color"], bsdf.inputs["Roughness"])
+
+    if tex_spec and tex_spec.image:
+        links.new(tex_spec.outputs["Color"], bsdf.inputs["Specular"])
 
     links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
@@ -174,7 +367,7 @@ def setUV(face, polygon, uvrect, uv_layer):
     except Exception as e:
         print(f"[WAD Import] UV error on face {face.index}: {e}")
 
-def createPageMaterial(filepath, context):
+def createPageMaterial(filepath, context, extra_texture_dirs=None):
     sprytile_installed = sprytile.check_install()
     obj = context.object
 
@@ -189,7 +382,7 @@ def createPageMaterial(filepath, context):
     if material_name in bpy.data.materials:
         mat = bpy.data.materials[material_name]
     else:
-        mat = generateNodesSetup(material_name, filepath)
+        mat = generateNodesSetup(material_name, filepath, extra_texture_dirs)
 
     bpy.data.materials.update()
 
@@ -226,7 +419,7 @@ def pack_textures(context, meshes, objects, options, name):
         print(f"Error: Texture could not be saved. Skipping material setup for {name}")
         return
 
-    mats = [generateNodesSetup(name, path)]
+    mats = [generateNodesSetup(name, path, [options.original_path])]
 
     for mesh, obj in zip(meshes, objects):
         sprytile.assign_material(context, obj, mats[0], sprytile_installed)
@@ -235,7 +428,10 @@ def pack_textures(context, meshes, objects, options, name):
         uv_layer = bm.loops.layers.uv.verify()
         roughness_layer = bm.loops.layers.color.new("shine")
         opacity_layer = bm.loops.layers.color.new("opacity")
-        sprytile.verify_bmesh_layers(bm)
+        mesh_uv_mapped = _is_uv_mapped_mesh(mesh)
+        setattr(obj.data, "_wad_uv_mapped", mesh_uv_mapped)
+        if not mesh_uv_mapped:
+            sprytile.verify_bmesh_layers(bm)
         for face_idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
             a, b, c, d = polygon.tbox
 
@@ -268,7 +464,7 @@ def pack_textures(context, meshes, objects, options, name):
             setUV(face, polygon, uvrect, uv_layer)
             setShineOpacity(obj, face, polygon, roughness_layer, opacity_layer)
 
-            if sprytile_installed:
+            if sprytile_installed and not mesh_uv_mapped:
                 sprytile.write_metadata(
                     context, obj, face_idx, bm, 
                     polygon.tex_width, polygon.tex_height, 
@@ -375,7 +571,7 @@ def pack_wad2_textures(context, meshes, objects, options, wad, name=''):
         return
 
     # Create material using the saved image
-    mat_normal = generateNodesSetup(atlas_name, atlas_path)
+    mat_normal = generateNodesSetup(atlas_name, atlas_path, [options.original_path])
 
     # Check if any polygon uses additive blending (blend_mode >= 2)
     has_additive = False
@@ -408,7 +604,9 @@ def pack_wad2_textures(context, meshes, objects, options, wad, name=''):
         uv_layer = bm.loops.layers.uv.verify()
         roughness_layer = bm.loops.layers.color.new("shine")
         opacity_layer = bm.loops.layers.color.new("opacity")
-        sprytile.verify_bmesh_layers(bm)
+        mesh_uv_mapped = _is_uv_mapped_mesh(mesh)
+        if not mesh_uv_mapped:
+            sprytile.verify_bmesh_layers(bm)
 
         for poly_idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
             # Assign material based on blend mode
@@ -446,7 +644,10 @@ def apply_textures(context, mesh, obj, materials, options, name=''):
     uv_layer = bm.loops.layers.uv.verify()
     roughness_layer = bm.loops.layers.color.new("shine")
     opacity_layer = bm.loops.layers.color.new("opacity")
-    sprytile.verify_bmesh_layers(bm)
+    mesh_uv_mapped = _is_uv_mapped_mesh(mesh)
+    setattr(obj.data, "_wad_uv_mapped", mesh_uv_mapped)
+    if not mesh_uv_mapped:
+        sprytile.verify_bmesh_layers(bm)
     for idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
         tile = min(polygon.tbox)
         tile_x, tile_y = tile
@@ -458,7 +659,7 @@ def apply_textures(context, mesh, obj, materials, options, name=''):
         setUV(face, polygon, polygon.tbox, uv_layer)
         setShineOpacity(obj, face, polygon, roughness_layer, opacity_layer)
 
-        if sprytile_installed and options.texture_pages:
+        if sprytile_installed and options.texture_pages and not mesh_uv_mapped:
             sprytile.write_metadata(
                 context, obj, idx, bm, 
                 polygon.tex_width, polygon.tex_height, 
