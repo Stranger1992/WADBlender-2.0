@@ -31,7 +31,7 @@ This add-on focuses on moving Tomb Raider WAD/WAD2 content between the TRLE tool
   - Create blank 256×256 texture page and assign as material
   - Add/import PNG textures to materials
   - Create vertex color layers for shade, shine, and opacity attributes
-- Shine & opacity/translucency editor (face selection; shine 0–31)
+- Shine & opacity/translucency editor (face selection; shine 0-31)
 - Texture packing/atlas generation for imported UV regions
 - Sprytile compatibility with appended Sprytile metadata
 - Optional library install (NumPy, PIL) for enhanced texture mappings and Sprytile workflows
