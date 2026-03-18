@@ -13,7 +13,7 @@ This add-on focuses on moving Tomb Raider WAD/WAD2 content between the TRLE tool
   - Game slot naming for objects/animations across TR game versions
   - Scale option (512 → 2 meters per TRLE block)
   - Reuse previously imported texture pages when names match
-- Mixamo animation import and retargeting to the `LARA_RIG` armature. Note: the importer currently requires the armature to be named exactly `LARA_RIG`.
+- Mixamo animation import and retargeting to the `LARA_RIG` armature.
 - FBX animation import (AoD and other sources) via rig retargeting
 
 ## Exporting
@@ -43,5 +43,6 @@ This add-on focuses on moving Tomb Raider WAD/WAD2 content between the TRLE tool
 
 ## Notes and limitations
 - Add-on is still under active development.
-- Importing multiple WADs into one .blend can create name conflicts (duplicate object/collection names or texture page reuse) because there is no automatic deduplication. As a workaround, import into separate files, or prefix/rename imported collections and texture pages before bringing in a second WAD.
+- Importing multiple WADs into one .blend can create name conflicts (duplicate object/collection names or texture page reuse) because there is no automatic deduplication. As a workaround, import into separate files, or prefix/rename imported collections and texture pages before bringing in a second WAD. Automatic conflict resolution is not yet implemented.
+- The importer currently requires the main armature to be named exactly `LARA_RIG`; custom naming is not supported yet.
 - FBX export may require adjusting NLA strips.
