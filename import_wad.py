@@ -502,7 +502,7 @@ class ImportWAD(Operator, ImportHelper):
                     uvmap.pixels = page
                     texture_path = options.path + name + ".png"
                     self._save_texture(uvmap, texture_path)
-                    material = createPageMaterial(texture_path, context)
+                    material = createPageMaterial(texture_path, context, [options.original_path])
                     materials.append(material)
             else:
                 # Load existing materials
