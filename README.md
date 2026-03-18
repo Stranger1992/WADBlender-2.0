@@ -64,8 +64,3 @@ You can show the WADBlender entry in the N panel when in edit mode. Set the sele
 * WADBlender includes the [Blender Rig Retargeting Addon](https://github.com/nkeeline/Keemap-Blender-Rig-ReTargeting-Addon) that allows mapping motions of one rig to another.
 * Few modifications were made for compatibility with WADBlender skeletons. There are also some additional options for inverting rotation angles and location coordinates.
 * See [Tutorial](https://github.com/veeti512/wadblender/blob/master/docs/tutorial.md) for importing Tomb Raider Angel of Darkness Lara Animations.
-
-### Sprytile:
-* Sprytile gives artists tools in Blender that speed up crafting stylized textured low poly models that evoke the feel of that era in gaming.
-* WAD Blender is compatible with Sprytile. WAD Blender appends to each object sprytile metadata. This metadata is used for features such as picking textures from one object face and assigning it to other faces.
-* Download Sprytile from https://jeiel.itch.io/sprytile 

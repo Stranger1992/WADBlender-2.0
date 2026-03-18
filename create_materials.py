@@ -4,8 +4,6 @@ from math import floor
 import bpy
 import bmesh
 
-from . import sprytile_utils as sprytile
-
 def _set_material_blend_mode(mat, mode):
     """Set material transparency mode compatible with Blender 4.2+ and older.
     
@@ -175,7 +173,6 @@ def setUV(face, polygon, uvrect, uv_layer):
         print(f"[WAD Import] UV error on face {face.index}: {e}")
 
 def createPageMaterial(filepath, context):
-    sprytile_installed = sprytile.check_install()
     obj = context.object
 
     # Extract EXACT material name expected by importer
@@ -195,17 +192,12 @@ def createPageMaterial(filepath, context):
 
     mat.name = material_name
 
-    if sprytile_installed:
-        sprytile.update(context)
-
     return mat
 
 
 def pack_textures(context, meshes, objects, options, name):
     from PIL import Image
     from .texture_packer import pack_object_textures
-
-    sprytile_installed = sprytile.check_install()
 
     texture_path = options.path + options.wadname + ".png"
     uvtable, new_texture_map = pack_object_textures(meshes, texture_path)
@@ -229,13 +221,12 @@ def pack_textures(context, meshes, objects, options, name):
     mats = [generateNodesSetup(name, path)]
 
     for mesh, obj in zip(meshes, objects):
-        sprytile.assign_material(context, obj, mats[0], sprytile_installed)
+        obj.data.materials.append(mats[0])
         bm = bmesh.new()
         bm.from_mesh(obj.data)
         uv_layer = bm.loops.layers.uv.verify()
         roughness_layer = bm.loops.layers.color.new("shine")
         opacity_layer = bm.loops.layers.color.new("opacity")
-        sprytile.verify_bmesh_layers(bm)
         for face_idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
             a, b, c, d = polygon.tbox
 
@@ -268,13 +259,6 @@ def pack_textures(context, meshes, objects, options, name):
             setUV(face, polygon, uvrect, uv_layer)
             setShineOpacity(obj, face, polygon, roughness_layer, opacity_layer)
 
-            if sprytile_installed:
-                sprytile.write_metadata(
-                    context, obj, face_idx, bm, 
-                    polygon.tex_width, polygon.tex_height, 
-                    tile_x, tile_y, polygon.flipX, polygon.flipY, mw
-                )
-
         bm.to_mesh(obj.data)
 
 
@@ -288,8 +272,6 @@ def pack_wad2_textures(context, meshes, objects, options, wad, name=''):
     """
     import numpy as np
     from .texture_packer import pack_wad2_textures as _pack_wad2
-
-    sprytile_installed = sprytile.check_install()
 
     # Convert the WAD2 texture page float lists to uint8 numpy arrays.
     # Each page is a flat list of floats (R,G,B,A in [0..1]),
@@ -408,8 +390,6 @@ def pack_wad2_textures(context, meshes, objects, options, wad, name=''):
         uv_layer = bm.loops.layers.uv.verify()
         roughness_layer = bm.loops.layers.color.new("shine")
         opacity_layer = bm.loops.layers.color.new("opacity")
-        sprytile.verify_bmesh_layers(bm)
-
         for poly_idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
             # Assign material based on blend mode
             blend = getattr(polygon, 'blend_mode', 0)
@@ -436,7 +416,6 @@ def pack_wad2_textures(context, meshes, objects, options, wad, name=''):
 
 
 def apply_textures(context, mesh, obj, materials, options, name=''):
-    sprytile_installed = sprytile.check_install()
     for i in range(len(materials)):
         obj.data.materials.append(materials[i])
 
@@ -446,7 +425,6 @@ def apply_textures(context, mesh, obj, materials, options, name=''):
     uv_layer = bm.loops.layers.uv.verify()
     roughness_layer = bm.loops.layers.color.new("shine")
     opacity_layer = bm.loops.layers.color.new("opacity")
-    sprytile.verify_bmesh_layers(bm)
     for idx, (polygon, face) in enumerate(zip(mesh.polygons, bm.faces)):
         tile = min(polygon.tbox)
         tile_x, tile_y = tile
@@ -457,12 +435,5 @@ def apply_textures(context, mesh, obj, materials, options, name=''):
         face.material_index = mat_index
         setUV(face, polygon, polygon.tbox, uv_layer)
         setShineOpacity(obj, face, polygon, roughness_layer, opacity_layer)
-
-        if sprytile_installed and options.texture_pages:
-            sprytile.write_metadata(
-                context, obj, idx, bm, 
-                polygon.tex_width, polygon.tex_height, 
-                tile_x, tile_y, polygon.flipX, polygon.flipY
-            )
 
     bm.to_mesh(obj.data)
